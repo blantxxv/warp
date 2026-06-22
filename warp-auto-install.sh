@@ -54,8 +54,7 @@ ENDPOINT_IPS="${WARP_ENDPOINT_IPS:-}"
 # Probing is randomized + capped so one scan finishes in a bounded time
 # instead of crawling through hundreds of dead combinations.
 MAX_PROBES="${WARP_MAX_PROBES:-60}"
-HANDSHAKE_WAIT="${WARP_HANDSHAKE_WAIT:-5}"
-HANDSHAKE_RETRIES="${WARP_HANDSHAKE_RETRIES:-2}"
+HANDSHAKE_WAIT="${WARP_HANDSHAKE_WAIT:-3}"
 
 # ----------------------------------------------------------------------------
 # Terminal capability detection & colors
@@ -215,8 +214,7 @@ Environment:
   WARP_PORTS           Ports to scan. Default: 2408 500 1701 4500
   WARP_ENDPOINT_IPS    Space-separated endpoint IPs to scan
   WARP_MAX_PROBES      Max endpoints probed per scan pass. Default: 60
-  WARP_HANDSHAKE_WAIT  Seconds to wait for handshake per attempt. Default: 5
-  WARP_HANDSHAKE_RETRIES  Retry attempts per endpoint before moving on. Default: 2
+  WARP_HANDSHAKE_WAIT  Seconds to wait for handshake per attempt. Default: 3
 EOF
 }
 
@@ -462,6 +460,23 @@ endpoint_set() {
   sed -i "s#^Endpoint = .*#Endpoint = ${endpoint}#g" "$CONF"
 }
 
+# Returns the peer public key from the WireGuard config, needed to push a
+# live endpoint change via `wg set` without restarting the whole interface.
+peer_pubkey() {
+  awk -F' = ' '/^PublicKey/ {print $2; exit}' "$CONF"
+}
+
+# Switches the live peer endpoint via `wg set` instead of `systemctl restart`.
+# A full service restart tears down and rebuilds the whole interface (routes,
+# DNS resolution, systemd unit bookkeeping) which costs the better part of a
+# second every time — across 60 probes that adds up to real, noticeable
+# delay. `wg set` just repoints the existing tunnel, taking milliseconds.
+endpoint_set_live() {
+  local endpoint="$1"
+  local pubkey="$2"
+  wg set "$IFACE" peer "$pubkey" endpoint "$endpoint" 2>/dev/null
+}
+
 warp_acceptable() {
   local loc="$1"
   [[ -z "$loc" ]] && return 1
@@ -494,20 +509,26 @@ current_warp_status_line() {
   echo "warp=${warp:-} loc=${loc:-} colo=${colo:-} ip=${ip:-}"
 }
 
-# Waits up to HANDSHAKE_WAIT seconds (polling every second) for a live
-# WireGuard handshake on $IFACE, instead of a single blind `sleep 3`.
-# This is the fix for endpoints that are reachable but just slow to
-# complete the handshake — previously they were marked dead too early.
+# Waits up to HANDSHAKE_WAIT seconds (polling frequently) for the WireGuard
+# handshake timestamp to advance past $baseline_ts. Comparing against a
+# baseline (not just "is it non-zero") matters because we now switch peer
+# endpoints live with `wg set` rather than restarting the interface — the
+# old endpoint's handshake timestamp is still sitting there and would
+# otherwise look like a false-positive success for the new endpoint.
+# Polling every 0.3s (not every 1s) means a fast handshake is caught
+# almost immediately instead of wasting up to a full second per check.
 wait_for_handshake() {
-  local waited=0
-  while (( waited < HANDSHAKE_WAIT )); do
+  local baseline_ts="$1"
+  local waited_ms=0
+  local wait_ms=$(( HANDSHAKE_WAIT * 1000 ))
+  while (( waited_ms < wait_ms )); do
     local hs
     hs="$(wg show "$IFACE" latest-handshakes 2>/dev/null | awk '{print $2}')"
-    if [[ -n "$hs" && "$hs" != "0" ]]; then
+    if [[ -n "$hs" && "$hs" != "0" && "$hs" != "$baseline_ts" ]]; then
       return 0
     fi
-    sleep 1
-    waited=$((waited + 1))
+    sleep 0.3
+    waited_ms=$((waited_ms + 300))
   done
   return 1
 }
@@ -546,6 +567,22 @@ scan_endpoints() {
   info "Максимум попыток за проход: $MAX_PROBES"
   : >"$SCAN_LOG_FILE"
 
+  local pubkey
+  pubkey="$(peer_pubkey)"
+  if [[ -z "$pubkey" ]]; then
+    fail "Не найден PublicKey в $CONF — нечего сканировать."
+    return 1
+  fi
+
+  # Interface must already be up so `wg set` has a live peer to retarget;
+  # we no longer restart the whole service per probe (see endpoint_set_live).
+  if ! ip link show "$IFACE" >/dev/null 2>&1; then
+    if ! systemctl restart "wg-quick@${IFACE}" >>"$LOG_FILE" 2>&1; then
+      fail "Не удалось поднять интерфейс ${IFACE} для скана."
+      return 1
+    fi
+  fi
+
   local endpoints=()
   while IFS= read -r ip; do
     endpoints+=("$ip")
@@ -558,6 +595,8 @@ scan_endpoints() {
   local n=0
   local found=0
   local best_loc="" best_endpoint=""
+  local scan_started_at
+  scan_started_at="$(date +%s)"
 
   for ip in "${endpoints[@]}"; do
     for port in $PORTS; do
@@ -567,26 +606,22 @@ scan_endpoints() {
 
       render_progress "$n" "$probes_to_run" "$endpoint"
 
-      endpoint_set "$endpoint"
+      local baseline_ts
+      baseline_ts="$(wg show "$IFACE" latest-handshakes 2>/dev/null | awk '{print $2}')"
 
-      if ! systemctl restart "wg-quick@${IFACE}" >/dev/null 2>&1; then
-        echo "endpoint=$endpoint restart=failed" >>"$SCAN_LOG_FILE"
+      if ! endpoint_set_live "$endpoint" "$pubkey"; then
+        echo "endpoint=$endpoint set=failed" >>"$SCAN_LOG_FILE"
         continue
       fi
 
-      local attempt=0
       local warp="" loc="" colo="" outip="" tr=""
-      while (( attempt <= HANDSHAKE_RETRIES )); do
-        if wait_for_handshake; then
-          tr="$(trace_warp)"
-          warp="$(trace_field "$tr" "warp")"
-          loc="$(trace_field "$tr" "loc")"
-          colo="$(trace_field "$tr" "colo")"
-          outip="$(trace_field "$tr" "ip")"
-          [[ -n "$warp" ]] && break
-        fi
-        attempt=$((attempt + 1))
-      done
+      if wait_for_handshake "${baseline_ts:-0}"; then
+        tr="$(trace_warp)"
+        warp="$(trace_field "$tr" "warp")"
+        loc="$(trace_field "$tr" "loc")"
+        colo="$(trace_field "$tr" "colo")"
+        outip="$(trace_field "$tr" "ip")"
+      fi
 
       echo "endpoint=$endpoint warp=${warp:-none} loc=${loc:-none} colo=${colo:-none} ip=${outip:-none}" >>"$SCAN_LOG_FILE"
 
@@ -597,7 +632,12 @@ scan_endpoints() {
         fi
         if warp_acceptable "$loc"; then
           if [[ "$IS_TTY" -eq 1 ]]; then printf "\n"; fi
-          say "Найден подходящий endpoint: $endpoint (loc=$loc, colo=$colo, ip=$outip)"
+          # wg set only changed the live runtime peer — persist the winning
+          # endpoint to the actual config file too, so it survives a reboot
+          # or a plain `systemctl restart` later.
+          endpoint_set "$endpoint"
+          local elapsed=$(( $(date +%s) - scan_started_at ))
+          say "Найден подходящий endpoint: $endpoint (loc=$loc, colo=$colo, ip=$outip) за ${elapsed}с / $n попыток"
           systemctl enable "wg-quick@${IFACE}" >/dev/null 2>&1 || true
           found=1
           break 2
@@ -612,7 +652,8 @@ scan_endpoints() {
     return 0
   fi
 
-  warn "Подходящий endpoint не найден за $n попыток (см. $SCAN_LOG_FILE)."
+  local elapsed=$(( $(date +%s) - scan_started_at ))
+  warn "Подходящий endpoint не найден за $n попыток (${elapsed}с, см. $SCAN_LOG_FILE)."
   if [[ -n "$best_endpoint" ]]; then
     warn "Лучший найденный вариант был loc=$best_loc на $best_endpoint, но это запрещённый/не разрешённый лок."
   else
