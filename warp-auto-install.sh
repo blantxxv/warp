@@ -350,11 +350,11 @@ server_region() {
   local c="$1"
   case "$c" in
     RU) echo "Россия" ;;
-    BY|KZ|AM|AZ|KG|TJ|TM|UZ|MD|UA) echo "СНГ / соседние" ;;
+    BY|AM|AZ|KG|TJ|TM|UZ|MD|UA) echo "СНГ / соседние" ;;
     AL|AD|AT|BE|BA|BG|HR|CY|CZ|DK|EE|FI|FR|DE|GR|HU|IS|IE|IT|XK|LV|LI|LT|LU|MT|MC|ME|NL|MK|NO|PL|PT|RO|SM|RS|SK|SI|ES|SE|CH|GB|VA) echo "Европа" ;;
     US|CA|MX|GT|BZ|SV|HN|NI|CR|PA|CU|DO|HT|JM|BS|BB|TT|AG|DM|GD|KN|LC|VC) echo "Северная Америка" ;;
     AR|BO|BR|CL|CO|EC|GY|PY|PE|SR|UY|VE) echo "Южная Америка" ;;
-    CN|HK|MO|TW|JP|KR|KP|MN|SG|MY|TH|VN|ID|PH|IN|PK|BD|LK|NP|AE|SA|QA|KW|BH|OM|TR|IL|GE) echo "Азия" ;;
+    CN|HK|MO|TW|JP|KZ|KR|KP|MN|SG|MY|TH|VN|ID|PH|IN|PK|BD|LK|NP|AE|SA|QA|KW|BH|OM|TR|IL|GE) echo "Азия" ;;
     AU|NZ|FJ|PG) echo "Океания" ;;
     *) echo "Unknown" ;;
   esac
