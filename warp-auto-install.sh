@@ -56,6 +56,29 @@ ENDPOINT_IPS="${WARP_ENDPOINT_IPS:-}"
 MAX_PROBES="${WARP_MAX_PROBES:-60}"
 HANDSHAKE_WAIT="${WARP_HANDSHAKE_WAIT:-3}"
 
+# Preferred loc(s) for AI access (US gives the broadest, least-filtered
+# access to ChatGPT/Claude/Gemini/etc). Scan phase 1 spends up to
+# PREFERRED_BUDGET probes hunting ONLY for these locs; if that budget runs
+# out without a hit, phase 2 falls back to the first endpoint that merely
+# satisfies DENY_LOCS/ACCEPT_LOCS (old behaviour), so the node is never left
+# without WARP just because US specifically wasn't reachable this pass.
+PREFERRED_LOCS="${WARP_PREFERRED_LOCS:-US}"
+PREFERRED_BUDGET="${WARP_PREFERRED_BUDGET:-40}"
+
+# Domains actually checked end-to-end through the warp interface (not just
+# cdn-cgi/trace) — Cloudflare's network-level "warp=on/loc=US" does not
+# guarantee these specific providers aren't geo/IP-blocking that same WARP
+# egress pool, so we probe them directly.
+AI_CHECK_DOMAINS="${WARP_AI_CHECK_DOMAINS:-chatgpt.com claude.ai gemini.google.com api.openai.com anthropic.com}"
+# Minimum fraction (in tenths, e.g. 6 = 60%) of AI_CHECK_DOMAINS that must
+# respond for the current WARP egress to be considered "good enough" —
+# below this the watchdog treats it the same as warp being fully down.
+AI_CHECK_MIN_OK_TENTHS="${WARP_AI_CHECK_MIN_OK_TENTHS:-6}"
+
+# How often the systemd timer rechecks WARP health (Cloudflare loc + real
+# AI domain reachability) and triggers a rescan if it's gone bad.
+WATCHDOG_INTERVAL_MIN="${WARP_WATCHDOG_INTERVAL_MIN:-5}"
+
 # ----------------------------------------------------------------------------
 # Terminal capability detection & colors
 # ----------------------------------------------------------------------------
@@ -204,17 +227,24 @@ Options:
   --uninstall          Remove WARP interface, timer and generated files
   --deny=RU,BY,KZ      Denied WARP loc values. Default: RU,BY,KZ,AM,AZ,KG,TJ,TM,UZ,MD
   --accept=DE,PL,BR    Optional allowed WARP loc values. Empty = accept any not denied
+  --prefer=US          Preferred loc(s), tried first. Default: US
+  --watchdog-interval=5  Minutes between watchdog rechecks. Default: 5
   --no-timer           Do not install watchdog timer
   --debug              Show executed shell commands
   -h, --help           Show help
 
 Environment:
-  WARP_DENY_LOCS       Same as --deny
-  WARP_ACCEPT_LOCS     Same as --accept
-  WARP_PORTS           Ports to scan. Default: 2408 500 1701 4500
-  WARP_ENDPOINT_IPS    Space-separated endpoint IPs to scan
-  WARP_MAX_PROBES      Max endpoints probed per scan pass. Default: 60
-  WARP_HANDSHAKE_WAIT  Seconds to wait for handshake per attempt. Default: 3
+  WARP_DENY_LOCS           Same as --deny
+  WARP_ACCEPT_LOCS         Same as --accept
+  WARP_PREFERRED_LOCS      Same as --prefer. Default: US
+  WARP_PREFERRED_BUDGET    Probes spent hunting preferred loc before fallback. Default: 40
+  WARP_WATCHDOG_INTERVAL_MIN  Minutes between watchdog rechecks. Default: 5
+  WARP_PORTS               Ports to scan. Default: 2408 500 1701 4500
+  WARP_ENDPOINT_IPS        Space-separated endpoint IPs to scan
+  WARP_MAX_PROBES          Max endpoints probed per scan pass. Default: 60
+  WARP_HANDSHAKE_WAIT      Seconds to wait for handshake per attempt. Default: 3
+  WARP_AI_CHECK_DOMAINS    Domains probed through warp to confirm AI access works
+  WARP_AI_CHECK_MIN_OK_TENTHS  Min fraction (in tenths) of domains that must respond. Default: 6
 EOF
 }
 
@@ -227,6 +257,8 @@ for arg in "$@"; do
     --rescan-only) MODE="rescan"; RESCAN_ONLY=1 ;;
     --deny=*) DENY_LOCS="${arg#*=}" ;;
     --accept=*) ACCEPT_LOCS="${arg#*=}" ;;
+    --prefer=*) PREFERRED_LOCS="${arg#*=}" ;;
+    --watchdog-interval=*) WATCHDOG_INTERVAL_MIN="${arg#*=}" ;;
     --no-timer) INSTALL_TIMER=0 ;;
     --debug) set -x ;;
     -h|--help) usage; exit 0 ;;
@@ -493,6 +525,53 @@ warp_acceptable() {
   return 0
 }
 
+# True only if loc is in the preferred list (e.g. US) AND still passes the
+# normal accept/deny filters. Used to drive scan phase 1 (US-first hunt).
+warp_preferred() {
+  local loc="$1"
+  [[ -z "$PREFERRED_LOCS" ]] && return 1
+  loc="$(echo "$loc" | tr '[:lower:]' '[:upper:]')"
+  csv_contains "$PREFERRED_LOCS" "$loc" || return 1
+  warp_acceptable "$loc"
+}
+
+# Probes real AI provider domains through the warp interface specifically.
+# Cloudflare's own cdn-cgi/trace reporting warp=on/loc=US does NOT guarantee
+# OpenAI/Anthropic/Google aren't independently blocking that exact WARP
+# egress pool (shared consumer WARP IPs get flagged/rate-limited by these
+# providers fairly often). Returns "ok_count total domain1=code domain2=code...".
+check_ai_domains_via_warp() {
+  local ok=0
+  local total=0
+  local detail=""
+  local domain code
+  for domain in $AI_CHECK_DOMAINS; do
+    total=$((total + 1))
+    code="$(curl -4 --interface "$IFACE" -o /dev/null -s -w '%{http_code}' \
+      --max-time 6 --connect-timeout 5 "https://${domain}/" 2>/dev/null || echo "000")"
+    # Anything that isn't a connection-level failure counts as "reachable":
+    # AI sites legitimately answer with 200/301/302/403 (region/bot pages)
+    # without that meaning the tunnel is broken — 000 means curl couldn't
+    # even connect, which is the actual failure signal we care about.
+    if [[ "$code" != "000" ]]; then
+      ok=$((ok + 1))
+    fi
+    detail="${detail}${domain}=${code} "
+  done
+  echo "${ok} ${total} ${detail}"
+}
+
+# Convenience wrapper returning 0/1 against AI_CHECK_MIN_OK_TENTHS threshold.
+ai_domains_acceptable() {
+  local result ok total
+  result="$(check_ai_domains_via_warp)"
+  ok="$(echo "$result" | awk '{print $1}')"
+  total="$(echo "$result" | awk '{print $2}')"
+  [[ "$total" -eq 0 ]] && return 1
+  # ok*10/total >= AI_CHECK_MIN_OK_TENTHS  <=>  ok*10 >= threshold*total
+  (( ok * 10 >= AI_CHECK_MIN_OK_TENTHS * total ))
+}
+
 format_status_value() {
   local k="$1"
   local v="$2"
@@ -561,6 +640,7 @@ scan_endpoints() {
   local backup="${CONF}.bak.$(date +%s)"
   cp "$CONF" "$backup"
 
+  info "Приоритетные loc (фаза 1): ${PREFERRED_LOCS:-нет} (бюджет: $PREFERRED_BUDGET попыток)"
   info "Запрещённые loc: ${DENY_LOCS:-нет}"
   info "Разрешённые loc: ${ACCEPT_LOCS:-любой, кроме запрещённых}"
   info "Порты: $PORTS"
@@ -592,9 +672,19 @@ scan_endpoints() {
   local probes_to_run="$MAX_PROBES"
   [[ "$probes_to_run" -gt "$total_combos" ]] && probes_to_run="$total_combos"
 
+  local preferred_budget="$PREFERRED_BUDGET"
+  [[ "$preferred_budget" -gt "$probes_to_run" ]] && preferred_budget="$probes_to_run"
+  [[ -z "$PREFERRED_LOCS" ]] && preferred_budget=0
+
   local n=0
   local found=0
+  local found_phase=""
+  local found_endpoint="" found_loc="" found_colo="" found_ip=""
   local best_loc="" best_endpoint=""
+  # First acceptable-but-not-preferred hit, kept as a fallback candidate in
+  # case phase 1 (US-only) burns its whole budget without success — this
+  # way we don't have to re-scan combinations already probed in phase 1.
+  local fallback_endpoint="" fallback_loc="" fallback_colo="" fallback_ip=""
   local scan_started_at
   scan_started_at="$(date +%s)"
 
@@ -604,7 +694,16 @@ scan_endpoints() {
       n=$((n + 1))
       local endpoint="${ip}:${port}"
 
-      render_progress "$n" "$probes_to_run" "$endpoint"
+      # Once we've exhausted the preferred-loc budget without a hit, and we
+      # already have a fallback candidate in hand, there's no point burning
+      # the rest of probes_to_run — stop and use the fallback immediately.
+      if [[ -n "$PREFERRED_LOCS" && "$n" -gt "$preferred_budget" && -n "$fallback_endpoint" ]]; then
+        break 2
+      fi
+
+      local label="$endpoint"
+      [[ -n "$PREFERRED_LOCS" && "$n" -le "$preferred_budget" ]] && label="${endpoint} [US-поиск]"
+      render_progress "$n" "$probes_to_run" "$label"
 
       local baseline_ts
       baseline_ts="$(wg show "$IFACE" latest-handshakes 2>/dev/null | awk '{print $2}')"
@@ -630,25 +729,82 @@ scan_endpoints() {
           best_endpoint="$endpoint"
           best_loc="$loc"
         fi
-        if warp_acceptable "$loc"; then
-          if [[ "$IS_TTY" -eq 1 ]]; then printf "\n"; fi
-          # wg set only changed the live runtime peer — persist the winning
-          # endpoint to the actual config file too, so it survives a reboot
-          # or a plain `systemctl restart` later.
-          endpoint_set "$endpoint"
-          local elapsed=$(( $(date +%s) - scan_started_at ))
-          say "Найден подходящий endpoint: $endpoint (loc=$loc, colo=$colo, ip=$outip) за ${elapsed}с / $n попыток"
-          systemctl enable "wg-quick@${IFACE}" >/dev/null 2>&1 || true
-          found=1
-          break 2
+
+        # Phase 1: still inside the preferred-loc budget — only a preferred
+        # loc (e.g. US) ends the scan outright.
+        if [[ -n "$PREFERRED_LOCS" && "$n" -le "$preferred_budget" ]]; then
+          if warp_preferred "$loc"; then
+            found_endpoint="$endpoint"; found_loc="$loc"; found_colo="$colo"; found_ip="$outip"
+            found_phase="preferred"
+            found=1
+            break 2
+          elif warp_acceptable "$loc" && [[ -z "$fallback_endpoint" ]]; then
+            # Acceptable but not preferred — remember it for fallback, keep
+            # looking for US within the remaining budget.
+            fallback_endpoint="$endpoint"; fallback_loc="$loc"; fallback_colo="$colo"; fallback_ip="$outip"
+          fi
+        else
+          # Phase 2 (preferred budget exhausted, or no preference set at
+          # all): the old behaviour — first acceptable loc wins immediately.
+          if warp_acceptable "$loc"; then
+            found_endpoint="$endpoint"; found_loc="$loc"; found_colo="$colo"; found_ip="$outip"
+            found_phase="fallback"
+            found=1
+            break 2
+          fi
         fi
       fi
     done
   done
 
+  # Preferred search ran out (budget or whole pool) without a direct hit,
+  # but we stashed an acceptable non-preferred endpoint along the way.
+  if [[ "$found" -ne 1 && -n "$fallback_endpoint" ]]; then
+    found_endpoint="$fallback_endpoint"; found_loc="$fallback_loc"
+    found_colo="$fallback_colo"; found_ip="$fallback_ip"
+    found_phase="fallback"
+    found=1
+  fi
+
   if [[ "$IS_TTY" -eq 1 ]]; then printf "\n"; fi
 
   if [[ "$found" -eq 1 ]]; then
+    # Re-point the live peer at the winner one more time — phase 1 may have
+    # moved past it while still hunting for US, or it came from the stashed
+    # fallback slot, so the interface might currently be pointed elsewhere.
+    local baseline_ts2
+    baseline_ts2="$(wg show "$IFACE" latest-handshakes 2>/dev/null | awk '{print $2}')"
+    endpoint_set_live "$found_endpoint" "$pubkey" || true
+    wait_for_handshake "${baseline_ts2:-0}" || true
+
+    endpoint_set "$found_endpoint"
+    local elapsed=$(( $(date +%s) - scan_started_at ))
+    if [[ "$found_phase" == "preferred" ]]; then
+      say "Найден ПРИОРИТЕТНЫЙ endpoint: $found_endpoint (loc=$found_loc, colo=$found_colo, ip=$found_ip) за ${elapsed}с / $n попыток"
+    else
+      warn "Приоритетный loc (${PREFERRED_LOCS}) не найден за бюджет ${preferred_budget} попыток."
+      say "Использую допустимый endpoint: $found_endpoint (loc=$found_loc, colo=$found_colo, ip=$found_ip) за ${elapsed}с / $n попыток"
+    fi
+    systemctl enable "wg-quick@${IFACE}" >/dev/null 2>&1 || true
+
+    # Real-world check: confirm the AI providers themselves are reachable
+    # through this exact egress, not just Cloudflare's own trace endpoint.
+    info "Проверка доступности AI-сервисов через $IFACE..."
+    local ai_result ai_ok ai_total ai_detail
+    ai_result="$(check_ai_domains_via_warp)"
+    ai_ok="$(echo "$ai_result" | awk '{print $1}')"
+    ai_total="$(echo "$ai_result" | awk '{print $2}')"
+    ai_detail="$(echo "$ai_result" | cut -d' ' -f3-)"
+    echo "ai_check endpoint=$found_endpoint ok=${ai_ok}/${ai_total} ${ai_detail}" >>"$SCAN_LOG_FILE"
+
+    if (( ai_ok * 10 >= AI_CHECK_MIN_OK_TENTHS * ai_total )); then
+      say "AI-сервисы доступны: ${ai_ok}/${ai_total} (${ai_detail})"
+    else
+      warn "AI-сервисы плохо доступны через этот endpoint: ${ai_ok}/${ai_total} (${ai_detail})"
+      warn "loc=${found_loc} формально допустим, но именно эта WARP-подсеть может быть зафлагована OpenAI/Google/Anthropic."
+      info "Можно перезапустить скан (пункт 2 меню / --rescan-only), он попадёт на другой IP/ASN."
+    fi
+
     return 0
   fi
 
@@ -678,8 +834,14 @@ CONF="${CONF}"
 TRACE_URL="${TRACE_URL}"
 DENY_LOCS_DEFAULT="${DENY_LOCS}"
 ACCEPT_LOCS_DEFAULT="${ACCEPT_LOCS}"
+PREFERRED_LOCS_DEFAULT="${PREFERRED_LOCS}"
+AI_CHECK_DOMAINS_DEFAULT="${AI_CHECK_DOMAINS}"
+AI_CHECK_MIN_OK_TENTHS_DEFAULT="${AI_CHECK_MIN_OK_TENTHS}"
 DENY_LOCS="\${WARP_DENY_LOCS:-\${DENY_LOCS_DEFAULT}}"
 ACCEPT_LOCS="\${WARP_ACCEPT_LOCS:-\${ACCEPT_LOCS_DEFAULT}}"
+PREFERRED_LOCS="\${WARP_PREFERRED_LOCS:-\${PREFERRED_LOCS_DEFAULT}}"
+AI_CHECK_DOMAINS="\${WARP_AI_CHECK_DOMAINS:-\${AI_CHECK_DOMAINS_DEFAULT}}"
+AI_CHECK_MIN_OK_TENTHS="\${WARP_AI_CHECK_MIN_OK_TENTHS:-\${AI_CHECK_MIN_OK_TENTHS_DEFAULT}}"
 IFACE="${IFACE}"
 
 trace_field() {
@@ -716,16 +878,38 @@ acceptable() {
   return 0
 }
 
+# Real end-to-end check: confirm chatgpt.com/claude.ai/gemini etc actually
+# answer through the warp interface, not just that Cloudflare's own trace
+# endpoint says warp=on/loc=OK. A WARP IP can be perfectly fine by
+# Cloudflare's own metric while being independently rate-limited/blocked by
+# the AI providers themselves (shared consumer WARP egress gets flagged).
+ai_domains_ok() {
+  local ok=0 total=0 code domain
+  for domain in \$AI_CHECK_DOMAINS; do
+    total=\$((total + 1))
+    code="\$(curl -4 --interface "\$IFACE" -o /dev/null -s -w '%{http_code}' \\
+      --max-time 6 --connect-timeout 5 "https://\${domain}/" 2>/dev/null || echo "000")"
+    [[ "\$code" != "000" ]] && ok=\$((ok + 1))
+  done
+  [[ "\$total" -eq 0 ]] && return 1
+  (( ok * 10 >= AI_CHECK_MIN_OK_TENTHS * total ))
+}
+
 tr="\$(curl -4 --interface "\$IFACE" --max-time 8 -s "\$TRACE_URL" || true)"
 warp="\$(trace_field "\$tr" "warp")"
 loc="\$(trace_field "\$tr" "loc")"
 
-if [[ "\$warp" == "on" ]] && acceptable "\$loc"; then
+if [[ "\$warp" == "on" ]] && acceptable "\$loc" && ai_domains_ok; then
   exit 0
 fi
 
-logger -t warp-auto "Bad WARP state: warp=\${warp:-empty} loc=\${loc:-empty}; rescanning endpoints"
-"${SELF_PATH_INSTALLED}" --rescan-only --deny="\${DENY_LOCS}" \${ACCEPT_LOCS:+--accept="\${ACCEPT_LOCS}"} --no-timer
+if [[ "\$warp" == "on" ]] && acceptable "\$loc"; then
+  logger -t warp-auto "WARP loc=\${loc:-empty} OK by Cloudflare, but AI domains unreachable through \$IFACE; rescanning"
+else
+  logger -t warp-auto "Bad WARP state: warp=\${warp:-empty} loc=\${loc:-empty}; rescanning endpoints"
+fi
+
+"${SELF_PATH_INSTALLED}" --rescan-only --deny="\${DENY_LOCS}" \${ACCEPT_LOCS:+--accept="\${ACCEPT_LOCS}"} \${PREFERRED_LOCS:+--prefer="\${PREFERRED_LOCS}"} --no-timer
 EOF_RECHECK
 
   chmod +x /usr/local/sbin/warp-auto-recheck.sh
@@ -739,14 +923,14 @@ Type=oneshot
 ExecStart=/usr/local/sbin/warp-auto-recheck.sh
 EOF_SERVICE
 
-  cat >/etc/systemd/system/warp-auto-recheck.timer <<'EOF_TIMER'
+  cat >/etc/systemd/system/warp-auto-recheck.timer <<EOF_TIMER
 [Unit]
 Description=Periodic Eclipse WARP egress location recheck
 
 [Timer]
 OnBootSec=2min
-OnUnitActiveSec=15min
-AccuracySec=1min
+OnUnitActiveSec=${WATCHDOG_INTERVAL_MIN}min
+AccuracySec=30sec
 Persistent=true
 
 [Install]
@@ -755,7 +939,7 @@ EOF_TIMER
 
   systemctl daemon-reload
   if systemctl enable --now warp-auto-recheck.timer >>"$LOG_FILE" 2>&1; then
-    say "Watchdog включён: warp-auto-recheck.timer (каждые 15 минут)"
+    say "Watchdog включён: warp-auto-recheck.timer (каждые ${WATCHDOG_INTERVAL_MIN} мин, проверяет loc + реальную доступность AI-доменов)"
   else
     warn "Не удалось включить watchdog timer. Смотри $LOG_FILE."
   fi
@@ -814,8 +998,25 @@ show_status() {
   format_status_value "Log" "$LOG_FILE"
   line
 
-  if [[ "$wwarp" == "on" ]] && warp_acceptable "$wloc"; then
-    say "Состояние нормальное: WARP работает, loc допустимый."
+  local ai_ok_state=0
+  if [[ "$wwarp" == "on" ]]; then
+    info "Проверка доступности AI-сервисов через $IFACE..."
+    local ai_result ai_ok ai_total ai_detail
+    ai_result="$(check_ai_domains_via_warp)"
+    ai_ok="$(echo "$ai_result" | awk '{print $1}')"
+    ai_total="$(echo "$ai_result" | awk '{print $2}')"
+    ai_detail="$(echo "$ai_result" | cut -d' ' -f3-)"
+    format_status_value "AI domains" "${ai_ok}/${ai_total} (${ai_detail})"
+    line
+    if (( ai_ok * 10 >= AI_CHECK_MIN_OK_TENTHS * ai_total )); then
+      ai_ok_state=1
+    fi
+  fi
+
+  if [[ "$wwarp" == "on" ]] && warp_acceptable "$wloc" && [[ "$ai_ok_state" -eq 1 ]]; then
+    say "Состояние нормальное: WARP работает, loc допустимый, AI-сервисы отвечают."
+  elif [[ "$wwarp" == "on" ]] && warp_acceptable "$wloc"; then
+    warn "loc допустимый, но AI-сервисы плохо отвечают через этот endpoint — стоит пересканировать (пункт 2)."
   else
     warn "Состояние требует внимания: WARP выключен или loc недопустимый."
   fi
@@ -842,8 +1043,17 @@ print_final_summary() {
   format_status_value "Timer" "$timer"
   format_status_value "Log" "$LOG_FILE"
 
+  if ip link show "$IFACE" >/dev/null 2>&1; then
+    local ai_result ai_ok ai_total ai_detail
+    ai_result="$(check_ai_domains_via_warp)"
+    ai_ok="$(echo "$ai_result" | awk '{print $1}')"
+    ai_total="$(echo "$ai_result" | awk '{print $2}')"
+    ai_detail="$(echo "$ai_result" | cut -d' ' -f3-)"
+    format_status_value "AI domains" "${ai_ok}/${ai_total} (${ai_detail})"
+  fi
+
   line
-  printf "${WHITE}${BOLD}Remnawave/Xray outbound:${RESET}\n\n"
+  printf "${WHITE}${BOLD}Remnawave/Xray outbound (добавь в outbounds):${RESET}\n\n"
   cat <<'EOF'
 {
   "tag": "warp-out",
@@ -860,12 +1070,84 @@ print_final_summary() {
 }
 EOF
 
+  printf "\n${WHITE}${BOLD}Routing rule (добавь В НАЧАЛО списка rules, до общих правил):${RESET}\n\n"
+  cat <<'EOF'
+{
+  "type": "field",
+  "domain": [
+    "domain:chatgpt.com",
+    "domain:openai.com",
+    "domain:oaistatic.com",
+    "domain:oaiusercontent.com",
+    "domain:oaistatsig.com",
+    "domain:openaimerge.com",
+    "domain:intercom.io",
+    "domain:intercomcdn.com",
+    "domain:ct.sendgrid.net",
+    "domain:sora.com",
+    "domain:claude.ai",
+    "domain:claude.com",
+    "domain:anthropic.com",
+    "domain:gemini.google.com",
+    "domain:gemini.google",
+    "domain:aistudio.google.com",
+    "domain:ai.google.dev",
+    "full:generativelanguage.googleapis.com",
+    "domain:makersuite.google.com",
+    "domain:notebooklm.google",
+    "domain:notebooklm.google.com",
+    "domain:labs.google",
+    "domain:flow.google",
+    "domain:codeassist.google",
+    "domain:copilot.microsoft.com",
+    "domain:copilot.cloud.microsoft",
+    "domain:m365.cloud.microsoft",
+    "domain:bing.com",
+    "domain:bingsandbox.com",
+    "domain:perplexity.ai",
+    "domain:pplx.ai",
+    "domain:perplexity.com",
+    "domain:mistral.ai",
+    "domain:chat.mistral.ai",
+    "domain:console.mistral.ai",
+    "domain:api.mistral.ai",
+    "domain:deepseek.com",
+    "domain:chat.deepseek.com",
+    "domain:api.deepseek.com",
+    "domain:grok.com",
+    "domain:x.ai",
+    "full:api.x.ai",
+    "domain:meta.ai",
+    "domain:ai.meta.com",
+    "domain:llama.com",
+    "domain:poe.com",
+    "domain:character.ai",
+    "domain:huggingface.co",
+    "domain:hf.co",
+    "domain:hf.space",
+    "domain:huggingfacecdn.com",
+    "domain:you.com",
+    "domain:phind.com",
+    "domain:cursor.com",
+    "domain:cursor.sh",
+    "domain:anysphere.co",
+    "domain:windsurf.com",
+    "domain:codeium.com",
+    "domain:replit.com"
+  ],
+  "outboundTag": "warp-out"
+}
+EOF
+
   printf "\n${WHITE}${BOLD}Проверки:${RESET}\n"
   cat <<'EOF'
   ip route
   wg show warp
   curl -4 --interface warp https://www.cloudflare.com/cdn-cgi/trace
   curl -4 https://www.cloudflare.com/cdn-cgi/trace
+  curl -4 --interface warp -o /dev/null -s -w '%{http_code}\n' https://chatgpt.com/
+  curl -4 --interface warp -o /dev/null -s -w '%{http_code}\n' https://claude.ai/
+  curl -4 --interface warp -o /dev/null -s -w '%{http_code}\n' https://gemini.google.com/
 EOF
 }
 
@@ -934,6 +1216,7 @@ auto_install() {
   step "Проверка сервера"
   format_status_value "Country" "$c"
   format_status_value "Region" "$region"
+  format_status_value "Preferred locs" "${PREFERRED_LOCS:-нет}"
   format_status_value "Deny locs" "$DENY_LOCS"
   format_status_value "Accept locs" "${ACCEPT_LOCS:-any except denied}"
   format_status_value "Log" "$LOG_FILE"
@@ -959,13 +1242,14 @@ menu() {
     banner
     printf "${WHITE}${BOLD}Выбери действие:${RESET}\n\n"
     printf "  ${GREEN}1)${RESET} Автоматическая установка WARP\n"
-    printf "  ${GREEN}2)${RESET} Пересканировать WARP endpoints\n"
+    printf "  ${GREEN}2)${RESET} Пересканировать WARP endpoints (US-приоритет)\n"
     printf "  ${GREEN}3)${RESET} Статус WARP\n"
-    printf "  ${GREEN}4)${RESET} Ручная инструкция\n"
-    printf "  ${GREEN}5)${RESET} Удалить/отключить WARP Manager\n"
+    printf "  ${GREEN}4)${RESET} Проверить доступность AI-сервисов через WARP\n"
+    printf "  ${GREEN}5)${RESET} Ручная инструкция\n"
+    printf "  ${GREEN}6)${RESET} Удалить/отключить WARP Manager\n"
     printf "  ${GREEN}0)${RESET} Выход\n"
-    printf "\n${GRAY}Настройки сейчас: deny=%s, accept=%s, iface=%s${RESET}\n" \
-      "${DENY_LOCS:-none}" "${ACCEPT_LOCS:-any}" "$IFACE"
+    printf "\n${GRAY}Настройки сейчас: prefer=%s, deny=%s, accept=%s, iface=%s${RESET}\n" \
+      "${PREFERRED_LOCS:-none}" "${DENY_LOCS:-none}" "${ACCEPT_LOCS:-any}" "$IFACE"
     printf "\nВведите номер: "
     read -r choice || true
 
@@ -973,8 +1257,36 @@ menu() {
       1) MODE="auto"; auto_install; pause_enter ;;
       2) MODE="rescan"; RESCAN_ONLY=1; require_root; ensure_safe_conf; start_warp; scan_endpoints; print_final_summary; pause_enter ;;
       3) show_status; pause_enter ;;
-      4) manual_page; pause_enter ;;
-      5) uninstall_warp; pause_enter ;;
+      4)
+        banner
+        step "Проверка AI-сервисов через $IFACE"
+        if ! ip link show "$IFACE" >/dev/null 2>&1; then
+          fail "Интерфейс $IFACE не найден. Сначала установи WARP (пункт 1)."
+        else
+          local ai_result ai_ok ai_total ai_detail
+          ai_result="$(check_ai_domains_via_warp)"
+          ai_ok="$(echo "$ai_result" | awk '{print $1}')"
+          ai_total="$(echo "$ai_result" | awk '{print $2}')"
+          ai_detail="$(echo "$ai_result" | cut -d' ' -f3-)"
+          for pair in $ai_detail; do
+            local d="${pair%=*}" c="${pair#*=}"
+            if [[ "$c" == "000" ]]; then
+              fail "$d -> нет соединения"
+            else
+              say "$d -> HTTP $c"
+            fi
+          done
+          line
+          if (( ai_ok * 10 >= AI_CHECK_MIN_OK_TENTHS * ai_total )); then
+            say "Итог: ${ai_ok}/${ai_total} доменов доступны — норма."
+          else
+            warn "Итог: ${ai_ok}/${ai_total} доменов доступны — мало, стоит пересканировать (пункт 2)."
+          fi
+        fi
+        pause_enter
+        ;;
+      5) manual_page; pause_enter ;;
+      6) uninstall_warp; pause_enter ;;
       0) exit 0 ;;
       *) warn "Неверный пункт меню"; sleep 1 ;;
     esac
