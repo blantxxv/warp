@@ -1,1470 +1,1290 @@
 #!/usr/bin/env bash
+
 set -Eeuo pipefail
 
-# Eclipse WARP Manager
-# Safe Cloudflare WARP WireGuard installer for Remnawave/Xray nodes.
-#
-# Design goals:
-#   - pretty interactive menu with progress bar
-#   - safe wgcf + wg-quick installation
-#   - no default-route hijack: Table=off
-#   - no system DNS rewrite: DNS line removed
-#   - reliable, shuffled, retrying endpoint scan until WARP loc is acceptable
-#   - watchdog timer to re-scan if WARP becomes denied-loc or goes offline
-#
-# Quick usage:
-#   bash warp-auto-install.sh
-#   bash warp-auto-install.sh --auto
-#   bash warp-auto-install.sh --rescan-only
-#   bash warp-auto-install.sh --status
-#
-# Options:
-#   --deny=RU,BY,KZ        Denied WARP loc values. Default: RU,BY,KZ,AM,AZ,KG,TJ,TM,UZ,MD
-#   --accept=DE,PL,BR      Optional allowed WARP loc values. Empty = accept any not denied
-#   --no-timer              Do not install periodic recheck timer
-#   --debug                 Verbose shell trace
+ORIGINAL_ARGS=("$@")
 
-SCRIPT_NAME="Eclipse WARP Manager"
-SCRIPT_VERSION="2.0.0"
-PROJECT_CHANNEL="t.me/light_eclipse"
+SCRIPT_VERSION="2.1.0"
 
-IFACE="warp"
-WG_DIR="/etc/wireguard"
-WGCF_BIN="/usr/local/bin/wgcf"
-CONF="${WG_DIR}/${IFACE}.conf"
-ACCOUNT="${WG_DIR}/wgcf-account.toml"
-PROFILE="${WG_DIR}/wgcf-profile.conf"
-TRACE_URL="https://www.cloudflare.com/cdn-cgi/trace"
-LOG_FILE="/var/log/warp-auto-install.log"
-SCAN_LOG_FILE="/var/log/warp-scan.log"
-SELF_PATH_INSTALLED="/root/warp-auto-install.sh"
+STATE_DIR="/var/lib/bbr3-remnanode"
+STATE_FILE="$STATE_DIR/state"
+LOG_FILE="/var/log/bbr3-remnanode-install.log"
+SCRIPT_PATH="/usr/local/sbin/bbr3-remnanode-install.sh"
+PROFILE_HOOK="/etc/profile.d/bbr3-remnanode-continue.sh"
 
-# CIS / "near abroad" countries are denied by default alongside RU, since WARP
-# frequently routes them onto the same flagged egress pool as RU.
-DENY_LOCS="${WARP_DENY_LOCS:-RU,BY,KZ,AM,AZ,KG,TJ,TM,UZ,MD}"
-ACCEPT_LOCS="${WARP_ACCEPT_LOCS:-}"
-INSTALL_TIMER=1
-RESCAN_ONLY=0
-MODE="menu"
+SELF_DOWNLOAD_URL="https://raw.githubusercontent.com/blantxxv/bbr3/main/bbr3-remnanode-auto.sh"
+WARP_INSTALL_URL="https://raw.githubusercontent.com/blantxxv/warp/main/warp-auto-install.sh"
 
-PORTS="${WARP_PORTS:-2408 500 1701 4500}"
-ENDPOINT_IPS="${WARP_ENDPOINT_IPS:-}"
+CPU_LEVEL=""
+KERNEL_INSTALL_SKIPPED=0
 
-# How many endpoints to actually probe in one scan pass before giving up.
-# Probing is randomized + capped so one scan finishes in a bounded time
-# instead of crawling through hundreds of dead combinations.
-MAX_PROBES="${WARP_MAX_PROBES:-60}"
-HANDSHAKE_WAIT="${WARP_HANDSHAKE_WAIT:-3}"
+KERNEL_VER="6.19.14-x64v3-xanmod1"
+XANMOD_BASE_URL="https://sourceforge.net/projects/xanmod/files/releases/main/6.19.14-xanmod1/6.19.14-x64v3-xanmod1"
+IMAGE_DEB_URL="$XANMOD_BASE_URL/linux-image-6.19.14-x64v3-xanmod1_6.19.14-x64v3-xanmod1-0~20260422.gb95d921_amd64.deb/download"
+HEADERS_DEB_URL="$XANMOD_BASE_URL/linux-headers-6.19.14-x64v3-xanmod1_6.19.14-x64v3-xanmod1-0~20260422.gb95d921_amd64.deb/download"
 
-# Optional pause between probes. Anti-torrent/DPI daemons that watch for
-# P2P-style behaviour (many short-lived connections to many different IPs
-# in a short window — exactly what a fast scan looks like) may flag/ban
-# based on burst rate. A small inter-probe delay can dodge that heuristic
-# without meaningfully slowing down a human-supervised scan. 0 = old
-# behaviour (no delay).
-PROBE_DELAY_MS="${WARP_PROBE_DELAY_MS:-0}"
+DEFAULT_NODE_PORT="2222"
+REMNANODE_DIR=""
+REMNANODE_LOG_DIR=""
+NODE_PORT=""
+NODE_DISPLAY_NAME=""
+COMPOSE_PROJECT_NAME=""
+CONTAINER_NAME=""
 
-# Preferred loc(s) for AI access (US gives the broadest, least-filtered
-# access to ChatGPT/Claude/Gemini/etc). Scan phase 1 spends up to
-# PREFERRED_BUDGET probes hunting ONLY for these locs; if that budget runs
-# out without a hit, phase 2 falls back to the first endpoint that merely
-# satisfies DENY_LOCS/ACCEPT_LOCS (old behaviour), so the node is never left
-# without WARP just because US specifically wasn't reachable this pass.
-PREFERRED_LOCS="${WARP_PREFERRED_LOCS:-US}"
-PREFERRED_BUDGET="${WARP_PREFERRED_BUDGET:-40}"
+DEBUG="${DEBUG:-0}"
 
-# Domains actually checked end-to-end through the warp interface (not just
-# cdn-cgi/trace) — Cloudflare's network-level "warp=on/loc=US" does not
-# guarantee these specific providers aren't geo/IP-blocking that same WARP
-# egress pool, so we probe them directly.
-AI_CHECK_DOMAINS="${WARP_AI_CHECK_DOMAINS:-chatgpt.com claude.ai gemini.google.com api.openai.com anthropic.com}"
-# Minimum fraction (in tenths, e.g. 6 = 60%) of AI_CHECK_DOMAINS that must
-# respond for the current WARP egress to be considered "good enough" —
-# below this the watchdog treats it the same as warp being fully down.
-AI_CHECK_MIN_OK_TENTHS="${WARP_AI_CHECK_MIN_OK_TENTHS:-6}"
-
-# How often the systemd timer rechecks WARP health (Cloudflare loc + real
-# AI domain reachability) and triggers a rescan if it's gone bad.
-WATCHDOG_INTERVAL_MIN="${WARP_WATCHDOG_INTERVAL_MIN:-5}"
-
-# ----------------------------------------------------------------------------
-# Terminal capability detection & colors
-# ----------------------------------------------------------------------------
-IS_TTY=0
 if [[ -t 1 ]]; then
-  IS_TTY=1
-fi
-
-# Respect NO_COLOR convention and dumb terminals too, not just non-tty output.
-if [[ "$IS_TTY" -eq 1 ]] && [[ -z "${NO_COLOR:-}" ]] && [[ "${TERM:-dumb}" != "dumb" ]]; then
-  RED=$'\033[0;31m'
-  GREEN=$'\033[0;32m'
-  YELLOW=$'\033[1;33m'
-  BLUE=$'\033[0;34m'
-  MAGENTA=$'\033[0;35m'
-  CYAN=$'\033[0;36m'
-  WHITE=$'\033[1;37m'
-  GRAY=$'\033[0;90m'
-  BOLD=$'\033[1m'
-  DIM=$'\033[2m'
-  RESET=$'\033[0m'
-  C_OK="$GREEN"
-  C_BAD="$RED"
-  C_WARN="$YELLOW"
-  C_ACCENT="$CYAN"
+  C_RESET=$'\033[0m'
+  C_BOLD=$'\033[1m'
+  C_DIM=$'\033[2m'
+  C_RED=$'\033[31m'
+  C_GREEN=$'\033[32m'
+  C_YELLOW=$'\033[33m'
+  C_BLUE=$'\033[34m'
+  C_CYAN=$'\033[36m'
 else
-  RED='' GREEN='' YELLOW='' BLUE='' MAGENTA='' CYAN='' WHITE='' GRAY='' BOLD='' DIM='' RESET=''
-  C_OK='' C_BAD='' C_WARN='' C_ACCENT=''
+  C_RESET=""
+  C_BOLD=""
+  C_DIM=""
+  C_RED=""
+  C_GREEN=""
+  C_YELLOW=""
+  C_BLUE=""
+  C_CYAN=""
 fi
 
-# Box-drawing glyphs (ASCII fallback if locale isn't UTF-8, so it never
-# renders as garbage mojibake on a minimal/serial console).
-# Locale strings vary in casing/format (UTF-8, utf8, UTF8), so normalize
-# before matching instead of relying on one exact pattern.
-_locale_check="${LC_ALL:-}${LC_CTYPE:-}${LANG:-}"
-_locale_check="$(echo "$_locale_check" | tr '[:upper:]' '[:lower:]' | tr -d '-')"
-if [[ "$_locale_check" == *utf8* ]]; then
-  BOX_TL="╭"; BOX_TR="╮"; BOX_BL="╰"; BOX_BR="╯"; BOX_H="─"; BOX_V="│"
-  ICON_OK="✔"; ICON_BAD="✘"; ICON_WARN="⚠"; ICON_INFO="ℹ"; ICON_ARROW="➜"
-else
-  BOX_TL="+"; BOX_TR="+"; BOX_BL="+"; BOX_BR="+"; BOX_H="-"; BOX_V="|"
-  ICON_OK="OK"; ICON_BAD="X"; ICON_WARN="!"; ICON_INFO="i"; ICON_ARROW="->"
-fi
+SPINNER_PID=""
 
-TERM_WIDTH=$(tput cols 2>/dev/null || echo 78)
-[[ "$TERM_WIDTH" -lt 60 ]] && TERM_WIDTH=78
-BOX_WIDTH=$(( TERM_WIDTH > 78 ? 78 : TERM_WIDTH ))
-
-mkdir -p "$(dirname "$LOG_FILE")"
-touch "$LOG_FILE" "$SCAN_LOG_FILE" 2>/dev/null || true
-
-log_file() {
-  printf '[%s] %s\n' "$(date '+%F %T')" "$*" >>"$LOG_FILE" 2>/dev/null || true
+cleanup_spinner() {
+  if [[ -n "${SPINNER_PID:-}" ]] && kill -0 "$SPINNER_PID" 2>/dev/null; then
+    kill "$SPINNER_PID" >/dev/null 2>&1 || true
+    wait "$SPINNER_PID" 2>/dev/null || true
+  fi
+  SPINNER_PID=""
 }
 
-repeat_char() {
-  local char="$1" count="$2"
-  printf '%*s' "$count" '' | tr ' ' "$char"
+trap cleanup_spinner EXIT
+
+print_banner() {
+  clear 2>/dev/null || true
+
+  cat <<BANNER
+${C_CYAN}${C_BOLD}
+┌──────────────────────────────────────────────────────────────┐
+│                    Eclipse Node Manager                      │
+│                  BBR3 + Remnawave Node Setup                 │
+│              XanMod Kernel · Network Tuning · Docker         │
+│                    Channel: t.me/light_eclipse               │
+└──────────────────────────────────────────────────────────────┘
+${C_RESET}
+${C_DIM}Версия скрипта: $SCRIPT_VERSION${C_RESET}
+${C_DIM}Log file: $LOG_FILE${C_RESET}
+
+BANNER
 }
 
-box_top() {
-  printf "${GRAY}%s%s%s${RESET}\n" "$BOX_TL" "$(repeat_char "$BOX_H" $((BOX_WIDTH - 2)))" "$BOX_TR"
-}
-
-box_bottom() {
-  printf "${GRAY}%s%s%s${RESET}\n" "$BOX_BL" "$(repeat_char "$BOX_H" $((BOX_WIDTH - 2)))" "$BOX_BR"
-}
-
-box_line() {
-  local text="$1"
-  local plain_len
-  plain_len="$(printf '%s' "$text" | sed -E 's/\x1b\[[0-9;]*m//g' | wc -m)"
-  local pad=$(( BOX_WIDTH - 4 - plain_len ))
-  [[ "$pad" -lt 0 ]] && pad=0
-  printf "${GRAY}%s${RESET} %s%*s ${GRAY}%s${RESET}\n" "$BOX_V" "$text" "$pad" "" "$BOX_V"
-}
-
-say() {
-  printf "  ${C_OK}%s${RESET} %s\n" "$ICON_OK" "$*"
-  log_file "OK: $*"
+section() {
+  echo
+  echo "${C_BLUE}${C_BOLD}▶ $*${C_RESET}"
 }
 
 info() {
-  printf "  ${C_ACCENT}%s${RESET} %s\n" "$ICON_INFO" "$*"
-  log_file "INFO: $*"
+  echo "${C_DIM}  $*${C_RESET}"
+}
+
+ok() {
+  echo "${C_GREEN}  [ OK ]${C_RESET} $*"
 }
 
 warn() {
-  printf "  ${C_WARN}%s${RESET} %s\n" "$ICON_WARN" "$*" >&2
-  log_file "WARN: $*"
+  mkdir -p "$(dirname "$LOG_FILE")"
+  echo -e "[$(date '+%F %T')] [WARN] $*" >> "$LOG_FILE"
+  echo "${C_YELLOW}  [WARN]${C_RESET} $*"
 }
 
 fail() {
-  printf "  ${C_BAD}%s${RESET} %s\n" "$ICON_BAD" "$*" >&2
-  log_file "ERROR: $*"
+  mkdir -p "$(dirname "$LOG_FILE")"
+  echo -e "[$(date '+%F %T')] [ERROR] $*" >> "$LOG_FILE"
+  echo "${C_RED}  [FAIL]${C_RESET} $*"
 }
 
-step() {
-  printf "\n${BOLD}${MAGENTA}%s %s${RESET}\n" "$ICON_ARROW" "$*"
-  log_file "STEP: $*"
+die() {
+  fail "$*"
+  echo
+  echo "${C_DIM}Подробный лог: $LOG_FILE${C_RESET}"
+  exit 1
 }
 
-line() {
-  printf "${GRAY}%s${RESET}\n" "$(repeat_char "$BOX_H" "$BOX_WIDTH")"
+log_line() {
+  mkdir -p "$(dirname "$LOG_FILE")"
+  echo -e "[$(date '+%F %T')] $*" >> "$LOG_FILE"
 }
 
-pause_enter() {
-  [[ "$MODE" == "menu" ]] || return 0
-  printf "\n${GRAY}Нажми Enter для продолжения...${RESET}"
-  read -r _ || true
+spinner() {
+  local msg="$1"
+  local chars='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+  local i=0
+
+  while true; do
+    printf "\r${C_CYAN}  [%s]${C_RESET} %s" "${chars:i++%${#chars}:1}" "$msg"
+    sleep 0.1
+  done
 }
 
-banner() {
-  clear 2>/dev/null || true
-  printf "${CYAN}"
-  cat <<'EOF'
-███████╗ ██████╗██╗     ██╗██████╗ ███████╗███████╗
-██╔════╝██╔════╝██║     ██║██╔══██╗██╔════╝██╔════╝
-█████╗  ██║     ██║     ██║██████╔╝███████╗█████╗
-██╔══╝  ██║     ██║     ██║██╔═══╝ ╚════██║██╔══╝
-███████╗╚██████╗███████╗██║██║     ███████║███████╗
-╚══════╝ ╚═════╝╚══════╝╚═╝╚═╝     ╚══════╝╚══════╝
-EOF
-  printf "${RESET}"
-  printf "          ${WHITE}${BOLD}WARP Manager для Remnawave Node${RESET}\n"
-  printf "          ${GRAY}%s ${DIM}•${RESET}${GRAY} version %s${RESET}\n" "$PROJECT_CHANNEL" "$SCRIPT_VERSION"
-  line
+show_last_log() {
+  echo
+  echo "${C_DIM}Последние строки лога:${C_RESET}"
+  tail -n 40 "$LOG_FILE" 2>/dev/null | sed 's/^/  /' || true
 }
-
-usage() {
-  cat <<EOF
-${SCRIPT_NAME} ${SCRIPT_VERSION}
-
-Usage:
-  $0
-  $0 --auto
-  $0 --status
-  $0 --rescan-only
-  $0 --uninstall
-
-Options:
-  --auto               Automatic install without interactive menu
-  --manual             Show manual commands
-  --status             Show current WARP status
-  --rescan-only        Re-scan endpoints using existing warp.conf
-  --uninstall          Remove WARP interface, timer and generated files
-  --deny=RU,BY,KZ      Denied WARP loc values. Default: RU,BY,KZ,AM,AZ,KG,TJ,TM,UZ,MD
-  --accept=DE,PL,BR    Optional allowed WARP loc values. Empty = accept any not denied
-  --prefer=US          Preferred loc(s), tried first. Default: US
-  --watchdog-interval=5  Minutes between watchdog rechecks. Default: 5
-  --slow-scan          Add ~800ms delay between probes (dodges anti-torrent/DPI burst detectors)
-  --probe-delay=MS     Custom delay between probes in milliseconds. Default: 0
-  --no-timer           Do not install watchdog timer
-  --debug              Show executed shell commands
-  -h, --help           Show help
-
-Environment:
-  WARP_DENY_LOCS           Same as --deny
-  WARP_ACCEPT_LOCS         Same as --accept
-  WARP_PREFERRED_LOCS      Same as --prefer. Default: US
-  WARP_PREFERRED_BUDGET    Probes spent hunting preferred loc before fallback. Default: 40
-  WARP_WATCHDOG_INTERVAL_MIN  Minutes between watchdog rechecks. Default: 5
-  WARP_PROBE_DELAY_MS      Delay between scan probes in ms. Default: 0 (see --slow-scan)
-  WARP_PORTS               Ports to scan. Default: 2408 500 1701 4500
-  WARP_ENDPOINT_IPS        Space-separated endpoint IPs to scan
-  WARP_MAX_PROBES          Max endpoints probed per scan pass. Default: 60
-  WARP_HANDSHAKE_WAIT      Seconds to wait for handshake per attempt. Default: 3
-  WARP_AI_CHECK_DOMAINS    Domains probed through warp to confirm AI access works
-  WARP_AI_CHECK_MIN_OK_TENTHS  Min fraction (in tenths) of domains that must respond. Default: 6
-EOF
-}
-
-for arg in "$@"; do
-  case "$arg" in
-    --auto) MODE="auto" ;;
-    --manual) MODE="manual" ;;
-    --status) MODE="status" ;;
-    --uninstall) MODE="uninstall" ;;
-    --rescan-only) MODE="rescan"; RESCAN_ONLY=1 ;;
-    --deny=*) DENY_LOCS="${arg#*=}" ;;
-    --accept=*) ACCEPT_LOCS="${arg#*=}" ;;
-    --prefer=*) PREFERRED_LOCS="${arg#*=}" ;;
-    --watchdog-interval=*) WATCHDOG_INTERVAL_MIN="${arg#*=}" ;;
-    --slow-scan) PROBE_DELAY_MS=800 ;;
-    --probe-delay=*) PROBE_DELAY_MS="${arg#*=}" ;;
-    --no-timer) INSTALL_TIMER=0 ;;
-    --debug) set -x ;;
-    -h|--help) usage; exit 0 ;;
-    *) fail "Unknown option: $arg"; usage; exit 1 ;;
-  esac
-done
 
 run_cmd() {
-  local desc="$1"
+  local msg="$1"
   shift
-  info "$desc"
-  log_file "CMD: $*"
-  "$@" >>"$LOG_FILE" 2>&1
-}
 
-require_root() {
-  if [[ "${EUID}" -ne 0 ]]; then
-    fail "Запусти от root: sudo -i"
-    exit 1
-  fi
-}
+  mkdir -p "$(dirname "$LOG_FILE")"
+  log_line "START: $msg"
+  log_line "CMD: $*"
 
-require_bin() {
-  local bin="$1"
-  command -v "$bin" >/dev/null 2>&1
-}
-
-detect_pkg_manager() {
-  if command -v apt-get >/dev/null 2>&1; then
-    echo "apt"
-  else
-    fail "Сейчас поддерживаются Debian/Ubuntu с apt-get."
-    exit 1
-  fi
-}
-
-install_deps() {
-  step "Установка базовых пакетов"
-  local pm
-  pm="$(detect_pkg_manager)"
-  if [[ "$pm" == "apt" ]]; then
-    export DEBIAN_FRONTEND=noninteractive
-    run_cmd "apt update" apt-get update
-    run_cmd "Установка wireguard-tools curl jq" \
-      apt-get install -y wireguard-tools curl jq ca-certificates iproute2
-  fi
-  for bin in wg wg-quick curl jq ip; do
-    if ! require_bin "$bin"; then
-      fail "Команда '$bin' не найдена после установки пакетов."
-      exit 1
-    fi
-  done
-  say "Зависимости на месте"
-}
-
-download_wgcf() {
-  step "Установка wgcf"
-
-  if require_bin wgcf && [[ -x "$WGCF_BIN" ]]; then
-    info "wgcf уже установлен: $($WGCF_BIN --version 2>/dev/null || echo 'версия неизвестна')"
-  fi
-
-  local url
-  url="$(curl -fsSL https://api.github.com/repos/ViRb3/wgcf/releases/latest \
-    | jq -r '.assets[] | select(.name | test("linux_amd64$")) | .browser_download_url' \
-    | head -n1)"
-
-  if [[ -z "$url" || "$url" == "null" ]]; then
-    fail "Не удалось получить URL wgcf linux_amd64 (GitHub API недоступен или rate-limit)."
-    exit 1
-  fi
-
-  info "wgcf URL: $url"
-  if ! curl -fL "$url" -o "$WGCF_BIN" >>"$LOG_FILE" 2>&1; then
-    fail "Не удалось скачать wgcf."
-    exit 1
-  fi
-  chmod +x "$WGCF_BIN"
-
-  if ! "$WGCF_BIN" --help >/dev/null 2>&1; then
-    fail "wgcf скачан, но не запускается. Проверь архитектуру (нужен amd64)."
-    exit 1
-  fi
-  say "wgcf установлен: $WGCF_BIN"
-}
-
-csv_contains() {
-  local csv="$1"
-  local needle="$2"
-  [[ -z "$csv" || -z "$needle" ]] && return 1
-  IFS=',' read -ra arr <<< "$csv"
-  for item in "${arr[@]}"; do
-    item="$(echo "$item" | tr '[:lower:]' '[:upper:]' | xargs)"
-    [[ "$item" == "$needle" ]] && return 0
-  done
-  return 1
-}
-
-trace_field() {
-  local trace="$1"
-  local field="$2"
-  echo "$trace" | awk -F= -v k="$field" '$1==k {print $2; exit}'
-}
-
-trace_direct() {
-  curl -4 --max-time 8 -s "$TRACE_URL" || true
-}
-
-trace_warp() {
-  curl -4 --interface "$IFACE" --max-time 8 -s "$TRACE_URL" || true
-}
-
-server_country() {
-  local tr loc
-  tr="$(trace_direct)"
-  loc="$(trace_field "$tr" "loc")"
-  echo "${loc:-UNKNOWN}"
-}
-
-server_region() {
-  local c="$1"
-  case "$c" in
-    RU) echo "Россия" ;;
-    BY|AM|AZ|KG|TJ|TM|UZ|MD|UA) echo "СНГ / соседние" ;;
-    AL|AD|AT|BE|BA|BG|HR|CY|CZ|DK|EE|FI|FR|DE|GR|HU|IS|IE|IT|XK|LV|LI|LT|LU|MT|MC|ME|NL|MK|NO|PL|PT|RO|SM|RS|SK|SI|ES|SE|CH|GB|VA) echo "Европа" ;;
-    US|CA|MX|GT|BZ|SV|HN|NI|CR|PA|CU|DO|HT|JM|BS|BB|TT|AG|DM|GD|KN|LC|VC) echo "Северная Америка" ;;
-    AR|BO|BR|CL|CO|EC|GY|PY|PE|SR|UY|VE) echo "Южная Америка" ;;
-    CN|HK|MO|TW|JP|KZ|KR|KP|MN|SG|MY|TH|VN|ID|PH|IN|PK|BD|LK|NP|AE|SA|QA|KW|BH|OM|TR|IL|GE) echo "Азия" ;;
-    AU|NZ|FJ|PG) echo "Океания" ;;
-    *) echo "Unknown" ;;
-  esac
-}
-
-# Builds the endpoint candidate pool, then shuffles it so every scan pass
-# (manual rescan, watchdog rescan, fresh install) explores a different order
-# instead of always retrying the same dead-on-arrival prefixes first.
-generate_endpoints() {
-  local pool=()
-
-  if [[ -n "$ENDPOINT_IPS" ]]; then
-    for ip in $ENDPOINT_IPS; do
-      pool+=("$ip")
-    done
-  else
-    local net
-    for net in 162.159.192 162.159.193 162.159.195 188.114.96 188.114.97; do
-      local i
-      for i in $(seq 0 254); do
-        pool+=("${net}.${i}")
-      done
-    done
-  fi
-
-  # Shuffle (Fisher-Yates) so repeated scans don't hammer the same prefix.
-  local n="${#pool[@]}"
-  local i j tmp
-  for ((i = n - 1; i > 0; i--)); do
-    j=$((RANDOM % (i + 1)))
-    tmp="${pool[i]}"
-    pool[i]="${pool[j]}"
-    pool[j]="$tmp"
-  done
-
-  printf '%s\n' "${pool[@]}"
-}
-
-create_profile() {
-  step "Создание WARP WireGuard профиля"
-  mkdir -p "$WG_DIR"
-  chmod 700 "$WG_DIR"
-  cd "$WG_DIR"
-
-  if [[ "$RESCAN_ONLY" -eq 1 ]]; then
-    [[ -f "$CONF" ]] || { fail "$CONF не найден для --rescan-only"; exit 1; }
-    return
-  fi
-
-  systemctl disable --now "wg-quick@${IFACE}" >/dev/null 2>&1 || true
-
-  rm -f "$ACCOUNT" "$PROFILE" "$CONF"
-
-  info "Регистрируем новый Cloudflare WARP аккаунт"
-  if "$WGCF_BIN" register --accept-tos >>"$LOG_FILE" 2>&1; then
-    :
-  elif yes | "$WGCF_BIN" register >>"$LOG_FILE" 2>&1; then
-    :
-  else
-    fail "Не удалось зарегистрировать WARP аккаунт (wgcf register). Проверь $LOG_FILE."
-    exit 1
-  fi
-
-  if ! "$WGCF_BIN" generate >>"$LOG_FILE" 2>&1; then
-    fail "wgcf generate завершился с ошибкой."
-    exit 1
-  fi
-
-  if [[ ! -f "$PROFILE" ]]; then
-    fail "wgcf-profile.conf не создан."
-    exit 1
-  fi
-
-  cp "$PROFILE" "$CONF"
-  chmod 600 "$CONF"
-
-  grep -q '^Table = off' "$CONF" || sed -i '/^\[Interface\]/a Table = off' "$CONF"
-  sed -i '/^DNS =/d' "$CONF"
-
-  say "Создан безопасный конфиг: $CONF"
-  info "Table=off включён, DNS строка удалена"
-}
-
-ensure_safe_conf() {
-  [[ -f "$CONF" ]] || { fail "$CONF не найден."; exit 1; }
-  grep -q '^Table = off' "$CONF" || sed -i '/^\[Interface\]/a Table = off' "$CONF"
-  sed -i '/^DNS =/d' "$CONF"
-  chmod 600 "$CONF"
-}
-
-start_warp() {
-  step "Запуск интерфейса ${IFACE}"
-  systemctl daemon-reload
-  if ! systemctl enable --now "wg-quick@${IFACE}" >>"$LOG_FILE" 2>&1; then
-    fail "Не удалось поднять интерфейс ${IFACE}. Смотри $LOG_FILE."
-    exit 1
-  fi
-  say "Интерфейс ${IFACE} запущен"
-}
-
-endpoint_set() {
-  local endpoint="$1"
-  sed -i "s#^Endpoint = .*#Endpoint = ${endpoint}#g" "$CONF"
-}
-
-# Returns the peer public key from the WireGuard config, needed to push a
-# live endpoint change via `wg set` without restarting the whole interface.
-peer_pubkey() {
-  awk -F' = ' '/^PublicKey/ {print $2; exit}' "$CONF"
-}
-
-# Switches the live peer endpoint via `wg set` instead of `systemctl restart`.
-# A full service restart tears down and rebuilds the whole interface (routes,
-# DNS resolution, systemd unit bookkeeping) which costs the better part of a
-# second every time — across 60 probes that adds up to real, noticeable
-# delay. `wg set` just repoints the existing tunnel, taking milliseconds.
-endpoint_set_live() {
-  local endpoint="$1"
-  local pubkey="$2"
-  wg set "$IFACE" peer "$pubkey" endpoint "$endpoint" 2>/dev/null
-}
-
-warp_acceptable() {
-  local loc="$1"
-  [[ -z "$loc" ]] && return 1
-  loc="$(echo "$loc" | tr '[:lower:]' '[:upper:]')"
-
-  if [[ -n "$ACCEPT_LOCS" ]]; then
-    csv_contains "$ACCEPT_LOCS" "$loc" || return 1
-  fi
-
-  if [[ -n "$DENY_LOCS" ]]; then
-    csv_contains "$DENY_LOCS" "$loc" && return 1
-  fi
-
-  return 0
-}
-
-# True only if loc is in the preferred list (e.g. US) AND still passes the
-# normal accept/deny filters. Used to drive scan phase 1 (US-first hunt).
-warp_preferred() {
-  local loc="$1"
-  [[ -z "$PREFERRED_LOCS" ]] && return 1
-  loc="$(echo "$loc" | tr '[:lower:]' '[:upper:]')"
-  csv_contains "$PREFERRED_LOCS" "$loc" || return 1
-  warp_acceptable "$loc"
-}
-
-# Probes real AI provider domains through the warp interface specifically.
-# Cloudflare's own cdn-cgi/trace reporting warp=on/loc=US does NOT guarantee
-# OpenAI/Anthropic/Google aren't independently blocking that exact WARP
-# egress pool (shared consumer WARP IPs get flagged/rate-limited by these
-# providers fairly often). Returns "ok_count total domain1=code domain2=code...".
-check_ai_domains_via_warp() {
-  local ok=0
-  local total=0
-  local detail=""
-  local domain code
-  for domain in $AI_CHECK_DOMAINS; do
-    total=$((total + 1))
-    # curl with -w '%{http_code}' prints "000" itself on a connect-level
-    # failure (timeout, refused, no route) AND still returns a non-zero
-    # exit code — so a naive `|| echo "000"` fallback double-prints,
-    # producing "000000". Just read curl's own %{http_code} output and
-    # ignore curl's exit status; fall back to "000" only if curl produced
-    # no output at all (e.g. it crashed before writing anything).
-    code="$(curl -4 --interface "$IFACE" -o /dev/null -s -w '%{http_code}' \
-      --max-time 6 --connect-timeout 5 "https://${domain}/" 2>/dev/null)"
-    code="${code:-000}"
-    # Defensive: if anything still produced a doubled/garbled value, keep
-    # only the last 3 digits so downstream comparisons stay well-formed.
-    [[ "$code" =~ ^[0-9]{4,}$ ]] && code="${code: -3}"
-    # Anything that isn't a connection-level failure counts as "reachable":
-    # AI sites legitimately answer with 200/301/302/403 (region/bot pages)
-    # without that meaning the tunnel is broken — 000 means curl couldn't
-    # even connect, which is the actual failure signal we care about.
-    if [[ "$code" != "000" ]]; then
-      ok=$((ok + 1))
-    fi
-    detail="${detail}${domain}=${code} "
-  done
-  echo "${ok} ${total} ${detail}"
-}
-
-# Convenience wrapper returning 0/1 against AI_CHECK_MIN_OK_TENTHS threshold.
-ai_domains_acceptable() {
-  local result ok total
-  result="$(check_ai_domains_via_warp)"
-  ok="$(echo "$result" | awk '{print $1}')"
-  total="$(echo "$result" | awk '{print $2}')"
-  [[ "$total" -eq 0 ]] && return 1
-  # ok*10/total >= AI_CHECK_MIN_OK_TENTHS  <=>  ok*10 >= threshold*total
-  (( ok * 10 >= AI_CHECK_MIN_OK_TENTHS * total ))
-}
-
-format_status_value() {
-  local k="$1"
-  local v="$2"
-  printf "  ${WHITE}%-18s${RESET} %s\n" "$k:" "${v:-—}"
-}
-
-current_warp_status_line() {
-  local tr warp loc colo ip
-  tr="$(trace_warp)"
-  warp="$(trace_field "$tr" "warp")"
-  loc="$(trace_field "$tr" "loc")"
-  colo="$(trace_field "$tr" "colo")"
-  ip="$(trace_field "$tr" "ip")"
-  echo "warp=${warp:-} loc=${loc:-} colo=${colo:-} ip=${ip:-}"
-}
-
-# Waits up to HANDSHAKE_WAIT seconds (polling frequently) for the WireGuard
-# handshake timestamp to advance past $baseline_ts. Comparing against a
-# baseline (not just "is it non-zero") matters because we now switch peer
-# endpoints live with `wg set` rather than restarting the interface — the
-# old endpoint's handshake timestamp is still sitting there and would
-# otherwise look like a false-positive success for the new endpoint.
-# Polling every 0.3s (not every 1s) means a fast handshake is caught
-# almost immediately instead of wasting up to a full second per check.
-wait_for_handshake() {
-  local baseline_ts="$1"
-  local waited_ms=0
-  local wait_ms=$(( HANDSHAKE_WAIT * 1000 ))
-  while (( waited_ms < wait_ms )); do
-    local hs
-    hs="$(wg show "$IFACE" latest-handshakes 2>/dev/null | awk '{print $2}')"
-    if [[ -n "$hs" && "$hs" != "0" && "$hs" != "$baseline_ts" ]]; then
+  if [[ "$DEBUG" == "1" ]]; then
+    echo "${C_CYAN}  [..]${C_RESET} $msg"
+    "$@" 2>&1 | tee -a "$LOG_FILE"
+    local rc="${PIPESTATUS[0]}"
+    if [[ "$rc" -eq 0 ]]; then
+      ok "$msg"
+      log_line "OK: $msg"
       return 0
     fi
-    sleep 0.3
-    waited_ms=$((waited_ms + 300))
-  done
-  return 1
-}
-
-# Renders a single-line, self-overwriting progress bar so a scan of dozens
-# of endpoints doesn't dump hundreds of lines to the terminal.
-render_progress() {
-  local current="$1" total="$2" label="$3"
-  local width=30
-  local filled=$(( current * width / (total > 0 ? total : 1) ))
-  [[ "$filled" -gt "$width" ]] && filled="$width"
-  local empty=$(( width - filled ))
-
-  local bar
-  bar="$(repeat_char '#' "$filled")$(repeat_char '.' "$empty")"
-
-  if [[ "$IS_TTY" -eq 1 ]]; then
-    printf "\r  ${CYAN}[%s]${RESET} %3d/%-3d %s" "$bar" "$current" "$total" "$label"
-    printf "%-30s" " "
-    printf "\r  ${CYAN}[%s]${RESET} %3d/%-3d %s" "$bar" "$current" "$total" "$label"
-  else
-    # Non-interactive output (logged to a file / panel): emit plain lines,
-    # not raw carriage returns that would otherwise look broken.
-    printf "  [%s] %d/%d %s\n" "$bar" "$current" "$total" "$label"
-  fi
-}
-
-scan_endpoints() {
-  step "Сканирование WARP endpoints"
-  local backup="${CONF}.bak.$(date +%s)"
-  cp "$CONF" "$backup"
-
-  info "Приоритетные loc (фаза 1): ${PREFERRED_LOCS:-нет} (бюджет: $PREFERRED_BUDGET попыток)"
-  info "Запрещённые loc: ${DENY_LOCS:-нет}"
-  info "Разрешённые loc: ${ACCEPT_LOCS:-любой, кроме запрещённых}"
-  info "Порты: $PORTS"
-  info "Максимум попыток за проход: $MAX_PROBES"
-  : >"$SCAN_LOG_FILE"
-
-  local pubkey
-  pubkey="$(peer_pubkey)"
-  if [[ -z "$pubkey" ]]; then
-    fail "Не найден PublicKey в $CONF — нечего сканировать."
-    return 1
+    fail "$msg"
+    log_line "FAIL: $msg rc=$rc"
+    return "$rc"
   fi
 
-  # Interface must already be up so `wg set` has a live peer to retarget;
-  # we no longer restart the whole service per probe (see endpoint_set_live).
-  if ! ip link show "$IFACE" >/dev/null 2>&1; then
-    if ! systemctl restart "wg-quick@${IFACE}" >>"$LOG_FILE" 2>&1; then
-      fail "Не удалось поднять интерфейс ${IFACE} для скана."
-      return 1
-    fi
-  fi
+  spinner "$msg" &
+  SPINNER_PID="$!"
 
-  local endpoints=()
-  while IFS= read -r ip; do
-    endpoints+=("$ip")
-  done < <(generate_endpoints)
+  set +e
+  "$@" >> "$LOG_FILE" 2>&1
+  local rc="$?"
+  set -e
 
-  local total_combos=$(( ${#endpoints[@]} * $(echo "$PORTS" | wc -w) ))
-  local probes_to_run="$MAX_PROBES"
-  [[ "$probes_to_run" -gt "$total_combos" ]] && probes_to_run="$total_combos"
+  cleanup_spinner
+  printf "\r\033[K"
 
-  local preferred_budget="$PREFERRED_BUDGET"
-  [[ "$preferred_budget" -gt "$probes_to_run" ]] && preferred_budget="$probes_to_run"
-  [[ -z "$PREFERRED_LOCS" ]] && preferred_budget=0
-
-  local n=0
-  local found=0
-  local found_phase=""
-  local found_endpoint="" found_loc="" found_colo="" found_ip=""
-  local best_loc="" best_endpoint=""
-  # First acceptable-but-not-preferred hit, kept as a fallback candidate in
-  # case phase 1 (US-only) burns its whole budget without success — this
-  # way we don't have to re-scan combinations already probed in phase 1.
-  local fallback_endpoint="" fallback_loc="" fallback_colo="" fallback_ip=""
-  local scan_started_at
-  scan_started_at="$(date +%s)"
-
-  for ip in "${endpoints[@]}"; do
-    for port in $PORTS; do
-      [[ "$n" -ge "$probes_to_run" ]] && break 2
-      n=$((n + 1))
-      local endpoint="${ip}:${port}"
-
-      # Once we've exhausted the preferred-loc budget without a hit, and we
-      # already have a fallback candidate in hand, there's no point burning
-      # the rest of probes_to_run — stop and use the fallback immediately.
-      if [[ -n "$PREFERRED_LOCS" && "$n" -gt "$preferred_budget" && -n "$fallback_endpoint" ]]; then
-        break 2
-      fi
-
-      local label="$endpoint"
-      [[ -n "$PREFERRED_LOCS" && "$n" -le "$preferred_budget" ]] && label="${endpoint} [US-поиск]"
-      render_progress "$n" "$probes_to_run" "$label"
-
-      if [[ "$PROBE_DELAY_MS" -gt 0 ]]; then
-        sleep "$(awk -v ms="$PROBE_DELAY_MS" 'BEGIN{printf "%.3f", ms/1000}')"
-      fi
-
-      local baseline_ts
-      baseline_ts="$(wg show "$IFACE" latest-handshakes 2>/dev/null | awk '{print $2}')"
-
-      if ! endpoint_set_live "$endpoint" "$pubkey"; then
-        echo "endpoint=$endpoint set=failed" >>"$SCAN_LOG_FILE"
-        continue
-      fi
-
-      local warp="" loc="" colo="" outip="" tr=""
-      if wait_for_handshake "${baseline_ts:-0}"; then
-        tr="$(trace_warp)"
-        warp="$(trace_field "$tr" "warp")"
-        loc="$(trace_field "$tr" "loc")"
-        colo="$(trace_field "$tr" "colo")"
-        outip="$(trace_field "$tr" "ip")"
-      fi
-
-      echo "endpoint=$endpoint warp=${warp:-none} loc=${loc:-none} colo=${colo:-none} ip=${outip:-none}" >>"$SCAN_LOG_FILE"
-
-      if [[ "$warp" == "on" ]]; then
-        if [[ -z "$best_endpoint" ]]; then
-          best_endpoint="$endpoint"
-          best_loc="$loc"
-        fi
-
-        # Phase 1: still inside the preferred-loc budget — only a preferred
-        # loc (e.g. US) ends the scan outright.
-        if [[ -n "$PREFERRED_LOCS" && "$n" -le "$preferred_budget" ]]; then
-          if warp_preferred "$loc"; then
-            found_endpoint="$endpoint"; found_loc="$loc"; found_colo="$colo"; found_ip="$outip"
-            found_phase="preferred"
-            found=1
-            break 2
-          elif warp_acceptable "$loc" && [[ -z "$fallback_endpoint" ]]; then
-            # Acceptable but not preferred — remember it for fallback, keep
-            # looking for US within the remaining budget.
-            fallback_endpoint="$endpoint"; fallback_loc="$loc"; fallback_colo="$colo"; fallback_ip="$outip"
-          fi
-        else
-          # Phase 2 (preferred budget exhausted, or no preference set at
-          # all): the old behaviour — first acceptable loc wins immediately.
-          if warp_acceptable "$loc"; then
-            found_endpoint="$endpoint"; found_loc="$loc"; found_colo="$colo"; found_ip="$outip"
-            found_phase="fallback"
-            found=1
-            break 2
-          fi
-        fi
-      fi
-    done
-  done
-
-  # Preferred search ran out (budget or whole pool) without a direct hit,
-  # but we stashed an acceptable non-preferred endpoint along the way.
-  if [[ "$found" -ne 1 && -n "$fallback_endpoint" ]]; then
-    found_endpoint="$fallback_endpoint"; found_loc="$fallback_loc"
-    found_colo="$fallback_colo"; found_ip="$fallback_ip"
-    found_phase="fallback"
-    found=1
-  fi
-
-  if [[ "$IS_TTY" -eq 1 ]]; then printf "\n"; fi
-
-  if [[ "$found" -eq 1 ]]; then
-    # Re-point the live peer at the winner one more time — phase 1 may have
-    # moved past it while still hunting for US, or it came from the stashed
-    # fallback slot, so the interface might currently be pointed elsewhere.
-    local baseline_ts2
-    baseline_ts2="$(wg show "$IFACE" latest-handshakes 2>/dev/null | awk '{print $2}')"
-    endpoint_set_live "$found_endpoint" "$pubkey" || true
-    wait_for_handshake "${baseline_ts2:-0}" || true
-
-    endpoint_set "$found_endpoint"
-    local elapsed=$(( $(date +%s) - scan_started_at ))
-    if [[ "$found_phase" == "preferred" ]]; then
-      say "Найден ПРИОРИТЕТНЫЙ endpoint: $found_endpoint (loc=$found_loc, colo=$found_colo, ip=$found_ip) за ${elapsed}с / $n попыток"
-    else
-      warn "Приоритетный loc (${PREFERRED_LOCS}) не найден за бюджет ${preferred_budget} попыток."
-      say "Использую допустимый endpoint: $found_endpoint (loc=$found_loc, colo=$found_colo, ip=$found_ip) за ${elapsed}с / $n попыток"
-    fi
-    systemctl enable "wg-quick@${IFACE}" >/dev/null 2>&1 || true
-
-    # Real-world check: confirm the AI providers themselves are reachable
-    # through this exact egress, not just Cloudflare's own trace endpoint.
-    info "Проверка доступности AI-сервисов через $IFACE..."
-    local ai_result ai_ok ai_total ai_detail
-    ai_result="$(check_ai_domains_via_warp)"
-    ai_ok="$(echo "$ai_result" | awk '{print $1}')"
-    ai_total="$(echo "$ai_result" | awk '{print $2}')"
-    ai_detail="$(echo "$ai_result" | cut -d' ' -f3-)"
-    echo "ai_check endpoint=$found_endpoint ok=${ai_ok}/${ai_total} ${ai_detail}" >>"$SCAN_LOG_FILE"
-
-    if (( ai_ok * 10 >= AI_CHECK_MIN_OK_TENTHS * ai_total )); then
-      say "AI-сервисы доступны: ${ai_ok}/${ai_total} (${ai_detail})"
-    else
-      warn "AI-сервисы плохо доступны через этот endpoint: ${ai_ok}/${ai_total} (${ai_detail})"
-      warn "loc=${found_loc} формально допустим, но именно эта WARP-подсеть может быть зафлагована OpenAI/Google/Anthropic."
-      info "Можно перезапустить скан (пункт 2 меню / --rescan-only), он попадёт на другой IP/ASN."
-    fi
-
+  if [[ "$rc" -eq 0 ]]; then
+    ok "$msg"
+    log_line "OK: $msg"
     return 0
   fi
 
-  local elapsed=$(( $(date +%s) - scan_started_at ))
-  warn "Подходящий endpoint не найден за $n попыток (${elapsed}с, см. $SCAN_LOG_FILE)."
-  if [[ -n "$best_endpoint" ]]; then
-    warn "Лучший найденный вариант был loc=$best_loc на $best_endpoint, но это запрещённый/не разрешённый лок."
-  else
-    warn "Ни один endpoint не дал успешный handshake (0 успехов из $n) — похоже на блокировку исходящего UDP."
-    diagnose_udp_block
-  fi
-  info "Восстанавливаю предыдущий конфиг."
-  cp "$backup" "$CONF"
-  systemctl restart "wg-quick@${IFACE}" >/dev/null 2>&1 || true
-  return 1
+  fail "$msg"
+  log_line "FAIL: $msg rc=$rc"
+  show_last_log
+  return "$rc"
 }
 
-# Runs when NOT A SINGLE probed endpoint produced a handshake. Distinguishes
-# "this whole server's outbound UDP is filtered" (hosting provider firewall,
-# common on budget VPS) from "just these specific Cloudflare IPs are bad"
-# so the user isn't left guessing why 60/60 probes failed identically.
-diagnose_udp_block() {
-  info "Диагностика исходящего UDP..."
+run_shell() {
+  local msg="$1"
+  local cmd="$2"
 
-  # 1) Can we even reach Cloudflare's anycast IP for the *trace* endpoint
-  #    over plain TCP/443? If this also fails, it's likely outbound
-  #    filtering in general, not something specific to UDP/WireGuard.
-  if curl -4 --max-time 5 -s -o /dev/null "https://1.1.1.1/cdn-cgi/trace" 2>/dev/null; then
-    say "TCP/443 до Cloudflare (1.1.1.1) работает — блокировка не на TCP-уровне."
-  else
-    warn "Даже TCP/443 до Cloudflare (1.1.1.1) не проходит — проблема шире, не только WARP/UDP."
+  mkdir -p "$(dirname "$LOG_FILE")"
+  log_line "START: $msg"
+  log_line "SHELL: $cmd"
+
+  if [[ "$DEBUG" == "1" ]]; then
+    echo "${C_CYAN}  [..]${C_RESET} $msg"
+    bash -lc "$cmd" 2>&1 | tee -a "$LOG_FILE"
+    local rc="${PIPESTATUS[0]}"
+    if [[ "$rc" -eq 0 ]]; then
+      ok "$msg"
+      log_line "OK: $msg"
+      return 0
+    fi
+    fail "$msg"
+    log_line "FAIL: $msg rc=$rc"
+    return "$rc"
   fi
 
-  # 2) Raw UDP send test against several WARP ports/IPs, bypassing
-  #    WireGuard entirely. A successful local `nc` send only proves the
-  #    packet left the box without an immediate ICMP-unreachable — it does
-  #    NOT prove anything arrived, since UDP is connectionless. This is
-  #    just a sanity check that nothing local refuses to even construct
-  #    the socket (e.g. a raw-socket cap restriction in some containers).
-  if command -v nc >/dev/null 2>&1; then
-    local probe_failed=0
-    local probe
-    for probe in "162.159.192.1:2408" "188.114.96.1:500" "162.159.193.10:4500"; do
-      local pip="${probe%:*}" pport="${probe#*:}"
-      if ! timeout 4 bash -c "echo -n '' | nc -4u -w2 '$pip' '$pport'" 2>/dev/null; then
-        probe_failed=$((probe_failed + 1))
-      fi
-    done
-    if [[ "$probe_failed" -eq 0 ]]; then
-      info "Локальная отправка UDP-пакетов на тестовые WARP IP/порты не встретила немедленных ошибок."
-    else
-      warn "$probe_failed из 3 локальных UDP-отправок завершились с ошибкой — возможна блокировка на уровне ОС/контейнера."
-    fi
+  spinner "$msg" &
+  SPINNER_PID="$!"
+
+  set +e
+  bash -lc "$cmd" >> "$LOG_FILE" 2>&1
+  local rc="$?"
+  set -e
+
+  cleanup_spinner
+  printf "\r\033[K"
+
+  if [[ "$rc" -eq 0 ]]; then
+    ok "$msg"
+    log_line "OK: $msg"
+    return 0
   fi
 
-  # 3) iptables/nftables: check the chains that actually decide the fate
-  #    of OUR traffic specifically, not just grep for any DROP line — the
-  #    earlier version flagged P2P/torrent block rules (BitTorrent, eMule,
-  #    DC++ ports) that have nothing to do with WARP and just caused
-  #    confusion. What actually matters: (a) the OUTPUT chain's default
-  #    policy, and (b) whether there's an explicit ACCEPT for the WARP
-  #    ports at all — under a default-DROP policy, *absence* of an ACCEPT
-  #    rule is the real blocker, not presence of unrelated DROP rules.
-  if command -v iptables >/dev/null 2>&1; then
-    local output_policy
-    output_policy="$(iptables -L OUTPUT -n 2>/dev/null | head -1 | grep -oP '(?<=policy )\w+' || echo "UNKNOWN")"
-    info "OUTPUT chain default policy: ${output_policy}"
-
-    if [[ "$output_policy" == "DROP" || "$output_policy" == "REJECT" ]]; then
-      local has_warp_accept
-      has_warp_accept="$(iptables -L OUTPUT -n 2>/dev/null | grep -E 'ACCEPT.*udp.*(2408|dpt:500|1701|4500)' || true)"
-      if [[ -z "$has_warp_accept" ]]; then
-        warn "OUTPUT policy=${output_policy} и НЕТ явного ACCEPT для портов WARP (2408/500/1701/4500)."
-        warn "Это сильный кандидат на причину: добавь правило вручную, например:"
-        warn "  iptables -I OUTPUT -p udp --dport 2408 -j ACCEPT"
-      else
-        info "Явный ACCEPT для портов WARP найден в OUTPUT — на уровне iptables разрешено."
-      fi
-    else
-      info "OUTPUT policy=${output_policy} (не блокирующая по умолчанию) — iptables, скорее всего, не причина."
-    fi
-
-    # Surface any DROP rule that specifically targets a WARP port (rare,
-    # but possible) — unrelated P2P-port DROP rules are intentionally NOT
-    # shown anymore since they only caused false alarms.
-    local warp_drop
-    warp_drop="$(iptables -L OUTPUT -n 2>/dev/null | grep -iE 'drop|reject' | grep -E '2408|1701|udp dpt:500($| )|4500' || true)"
-    if [[ -n "$warp_drop" ]]; then
-      warn "Найдено явное DROP/REJECT правило конкретно для порта WARP:"
-      printf '%s\n' "$warp_drop" | while IFS= read -r l; do warn "  $l"; done
-    fi
-  fi
-
-  # 4) Dynamic anti-torrent / DPI daemons (e.g. ipset+xt_string based
-  #    blockers commonly run alongside Xray/Remnawave) ban IPs in real
-  #    time based on traffic *behaviour*, not fixed ports — a static
-  #    `iptables -L` snapshot can miss this entirely if rules live in an
-  #    ipset set, or if the ban already expired by the time we look. A
-  #    fast burst of 60 UDP probes to dozens of different Cloudflare IPs
-  #    in under a minute (exactly what the scanner just did) looks a lot
-  #    like P2P peer-swarming to a behavioural/FIN_WAIT heuristic.
-  local found_blocker_svc=""
-  local svc
-  for svc in torrent-blocker xray-blocker dpi-blocker antitorrent torrentguard; do
-    if systemctl is-active "$svc" >/dev/null 2>&1; then
-      found_blocker_svc="$svc"
-      break
-    fi
-  done
-
-  if [[ -n "$found_blocker_svc" ]]; then
-    warn "Обнаружен активный сервис '$found_blocker_svc' — анти-торрент демон с DPI/поведенческим анализом."
-    warn "Такие демоны банят IP ДИНАМИЧЕСКИ (через ipset, не только iptables) на основе паттернов трафика,"
-    warn "а не только по фиксированным портам — статичный 'iptables -L' выше мог этого не показать."
-    warn "Быстрый скан (60 UDP-проб за минуту к разным Cloudflare IP) сам похож на P2P-поведение"
-    warn "и может триггерить такой бан по ошибке (false positive)."
-    if command -v ipset >/dev/null 2>&1; then
-      local ipset_sets
-      ipset_sets="$(ipset list -n 2>/dev/null || true)"
-      if [[ -n "$ipset_sets" ]]; then
-        info "Активные ipset-наборы (проверь, не там ли бан): $ipset_sets"
-      fi
-    fi
-    info "Попробуй сначала просто замедлить скан (он сам похож на burst-паттерн):"
-    info "  bash $0 --rescan-only --slow-scan"
-    info "Если это не помогло — временно останови демон и повтори обычный скан: systemctl stop $found_blocker_svc"
-    info "Если после остановки WARP подключается — это точно он, дальше добавь WARP IP (162.159.0.0/16,"
-    info "188.114.0.0/16) или UDP-порт 2408 в исключения/bypass этого демона (флаг --bypass у torrent-blocker)."
-  elif command -v ipset >/dev/null 2>&1 && [[ -n "$(ipset list -n 2>/dev/null)" ]]; then
-    info "ipset активен (наборы: $(ipset list -n 2>/dev/null | tr '\n' ' ')), хотя известный сервис-блокер не найден."
-    info "Если на сервере стоит свой анти-торрент/DPI скрипт — проверь его правила и логи отдельно."
-  fi
-
-  line
-  info "ВАЖНО: многие хостеры (Hetzner, OVH, DigitalOcean, Vultr, AWS Security Groups и т.п.) держат отдельный"
-  info "облачный firewall ВНЕ сервера (в панели управления) — он не виден ни в iptables, ни в nft, и режет"
-  info "трафик ДО того, как пакет вообще доходит до ОС. Если правила выше выглядят нормально, в первую очередь"
-  info "проверь именно панель хостера: должен быть разрешён исходящий UDP, особенно на порт 2408."
-  info "Быстрый способ проверить версию 'не в iptables дело': временно 'iptables -P OUTPUT ACCEPT' и повторить скан."
+  fail "$msg"
+  log_line "FAIL: $msg rc=$rc"
+  show_last_log
+  return "$rc"
 }
 
-install_watchdog() {
-  [[ "$INSTALL_TIMER" -eq 1 ]] || return 0
+run_shell_live() {
+  local msg="$1"
+  local cmd="$2"
 
-  step "Установка watchdog timer"
+  mkdir -p "$(dirname "$LOG_FILE")"
+  log_line "START LIVE: $msg"
+  log_line "SHELL LIVE: $cmd"
 
-  cat >/usr/local/sbin/warp-auto-recheck.sh <<EOF_RECHECK
+  echo "${C_CYAN}  [..]${C_RESET} $msg"
+  echo "${C_DIM}  ────────────────────────────────────────────────────────────${C_RESET}"
+
+  set +e
+  bash -lc "$cmd" 2>&1 | tee -a "$LOG_FILE"
+  local rc="${PIPESTATUS[0]}"
+  set -e
+
+  echo "${C_DIM}  ────────────────────────────────────────────────────────────${C_RESET}"
+
+  if [[ "$rc" -eq 0 ]]; then
+    ok "$msg"
+    log_line "OK LIVE: $msg"
+    return 0
+  fi
+
+  fail "$msg"
+  log_line "FAIL LIVE: $msg rc=$rc"
+  show_last_log
+  return "$rc"
+}
+
+need_root() {
+  [[ "${EUID}" -eq 0 ]] || die "Запусти скрипт от root."
+}
+
+set_state() {
+  mkdir -p "$STATE_DIR"
+  echo "$1" > "$STATE_FILE"
+}
+
+get_state() {
+  cat "$STATE_FILE" 2>/dev/null || true
+}
+
+detect_iface() {
+  ip route get 1.1.1.1 2>/dev/null | awk '/dev/ {for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}'
+}
+
+docker_compose() {
+  if docker compose version >/dev/null 2>&1; then
+    docker compose "$@"
+  elif command -v docker-compose >/dev/null 2>&1; then
+    docker-compose "$@"
+  else
+    die "Docker Compose не найден. Нужен docker compose plugin или docker-compose."
+  fi
+}
+
+download_self_latest() {
+  local target="$1"
+  local tmp
+
+  mkdir -p "$(dirname "$target")"
+  tmp="$(mktemp "${target}.tmp.XXXXXX")"
+
+  curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors \
+    -H 'Cache-Control: no-cache' \
+    -H 'Pragma: no-cache' \
+    -o "$tmp" \
+    "${SELF_DOWNLOAD_URL}?ts=$(date +%s)"
+
+  if ! bash -n "$tmp" >> "$LOG_FILE" 2>&1; then
+    rm -f "$tmp"
+    die "Скачанный скрипт не прошёл bash -n. Обновление отменено."
+  fi
+
+  mv -f "$tmp" "$target"
+  chmod 700 "$target"
+}
+
+ensure_saved_script_is_latest() {
+  local current_src=""
+  current_src="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)"
+
+  if run_cmd "Обновляю системную копию скрипта" download_self_latest "$SCRIPT_PATH"; then
+    return 0
+  fi
+
+  if [[ -n "$current_src" && -r "$current_src" && "$current_src" != "$SCRIPT_PATH" ]]; then
+    warn "GitHub недоступен. Сохраняю текущую локальную копию для продолжения после reboot."
+    run_cmd "Сохраняю локальную копию скрипта" cp -- "$current_src" "$SCRIPT_PATH"
+    chmod 700 "$SCRIPT_PATH"
+    return 0
+  fi
+
+  die "Не удалось подготовить актуальную системную копию скрипта."
+}
+
+save_self() {
+  ensure_saved_script_is_latest
+}
+
+# Возвращает успех (0), если версия $1 строго новее версии $2.
+version_gt() {
+  local a="$1" b="$2"
+
+  [[ "$a" == "$b" ]] && return 1
+
+  local lower
+  lower="$(printf '%s\n%s\n' "$a" "$b" | sort -V | head -n 1)"
+
+  [[ "$lower" == "$b" ]]
+}
+
+fetch_remote_script() {
+  curl -fsSL --connect-timeout 5 --max-time 20 --retry 3 --retry-delay 2 --retry-all-errors \
+    -H 'Cache-Control: no-cache' \
+    -H 'Pragma: no-cache' \
+    "${SELF_DOWNLOAD_URL}?ts=$(date +%s)" 2>/dev/null || true
+}
+
+extract_script_version() {
+  echo "$1" | grep -m1 '^SCRIPT_VERSION=' | sed -E 's/^SCRIPT_VERSION="([^"]*)".*/\1/'
+}
+
+# Подчищает старые/временные копии скрипта, чтобы не было конфликта версий.
+cleanup_old_script_copies() {
+  rm -f "${SCRIPT_PATH}".tmp.* 2>/dev/null || true
+  rm -f "${SCRIPT_PATH}".bak 2>/dev/null || true
+}
+
+update_self_and_restart() {
+  local remote_content="$1"
+  local tmp
+
+  mkdir -p "$(dirname "$SCRIPT_PATH")"
+  tmp="$(mktemp "${SCRIPT_PATH}.tmp.XXXXXX")"
+  printf '%s\n' "$remote_content" > "$tmp"
+
+  if ! bash -n "$tmp" >> "$LOG_FILE" 2>&1; then
+    rm -f "$tmp"
+    die "Скачанный скрипт не прошёл проверку синтаксиса (bash -n). Обновление отменено."
+  fi
+
+  cleanup_old_script_copies
+  mv -f "$tmp" "$SCRIPT_PATH"
+  chmod 700 "$SCRIPT_PATH"
+
+  ok "Скрипт обновлён. Перезапускаю новую версию..."
+  log_line "Self-update: restarting via $SCRIPT_PATH ${ORIGINAL_ARGS[*]:-}"
+  exec "$SCRIPT_PATH" "${ORIGINAL_ARGS[@]}"
+}
+
+check_for_updates() {
+  section "Проверка обновлений"
+
+  local remote_content remote_version
+  remote_content="$(fetch_remote_script)"
+
+  if [[ -z "$remote_content" ]]; then
+    warn "Не удалось получить актуальную версию скрипта с GitHub. Проверь сеть и попробуй позже."
+    return 1
+  fi
+
+  remote_version="$(extract_script_version "$remote_content")"
+
+  if [[ -z "$remote_version" ]]; then
+    warn "Не удалось определить версию в скачанном скрипте."
+    return 1
+  fi
+
+  ok "Текущая версия: $SCRIPT_VERSION"
+  ok "Версия на GitHub: $remote_version"
+
+  if [[ "$remote_version" == "$SCRIPT_VERSION" ]]; then
+    ok "Установлена последняя версия скрипта."
+    return 0
+  fi
+
+  if version_gt "$remote_version" "$SCRIPT_VERSION"; then
+    echo
+    warn "Доступна новая версия скрипта: $remote_version (у тебя $SCRIPT_VERSION)."
+    read -rp "  Установить обновление сейчас? [y/N]: " ans
+
+    case "${ans,,}" in
+      y|yes|д|да)
+        update_self_and_restart "$remote_content"
+        ;;
+      *)
+        ok "Обновление отложено."
+        ;;
+    esac
+  else
+    ok "Локальная версия не старше удалённой ($SCRIPT_VERSION vs $remote_version)."
+  fi
+}
+
+# Тихая проверка обновлений для главного меню: не блокирует, не спрашивает,
+# просто подсказывает, что есть новая версия (пункт меню "4").
+notify_if_update_available() {
+  local remote_content remote_version
+
+  remote_content="$(curl -fsSL --connect-timeout 3 --max-time 6 \
+    "${SELF_DOWNLOAD_URL}?ts=$(date +%s)" 2>/dev/null || true)"
+
+  [[ -n "$remote_content" ]] || return 0
+
+  remote_version="$(extract_script_version "$remote_content")"
+  [[ -n "$remote_version" ]] || return 0
+
+  if version_gt "$remote_version" "$SCRIPT_VERSION"; then
+    echo "${C_YELLOW}  Доступна новая версия: $remote_version (у тебя $SCRIPT_VERSION). Пункт меню «4» — обновить.${C_RESET}"
+    echo
+  fi
+}
+
+clean_bad_docker_apt_sources() {
+  section "Проверка APT репозиториев"
+
+  local bad_files invalid_files backup_dir f changed=0 ts
+  ts="$(date +%s)"
+  backup_dir="/etc/apt/sources.list.d.disabled-by-eclipse"
+
+  mkdir -p "$backup_dir"
+
+  bad_files="$(grep -rl "download.docker.com/linux/ubuntu" /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null || true)"
+  invalid_files="$(find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name "*.disabled*" -o -name "*.bak*" -o -name "*.save*" \) 2>/dev/null || true)"
+
+  if [[ -z "$bad_files" && -z "$invalid_files" ]]; then
+    ok "Проблемные Docker/backup APT sources не найдены"
+    return 0
+  fi
+
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+
+    if [[ "$f" == "/etc/apt/sources.list" ]]; then
+      warn "Комментирую неправильные Docker Ubuntu строки в $f"
+      cp -a "$f" "$backup_dir/sources.list.bak.$ts"
+      sed -i '/download\.docker\.com\/linux\/ubuntu/s/^/# disabled by Eclipse Node Manager: /' "$f"
+      changed=1
+      continue
+    fi
+
+    warn "Переношу неправильный Docker Ubuntu repo: $f"
+    mv -f "$f" "$backup_dir/$(basename "$f").$ts"
+    changed=1
+  done <<< "$bad_files"
+
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    [[ -e "$f" ]] || continue
+
+    warn "Убираю backup-файл из sources.list.d, чтобы apt не ругался: $f"
+    mv -f "$f" "$backup_dir/$(basename "$f").$ts"
+    changed=1
+  done <<< "$invalid_files"
+
+  if [[ "$changed" -eq 1 ]]; then
+    ok "APT sources очищены"
+  fi
+}
+
+install_base_packages() {
+  section "1/12 · Базовые пакеты"
+
+  clean_bad_docker_apt_sources
+
+  run_cmd "Обновляю APT index" env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none apt-get update
+
+  run_cmd "Устанавливаю утилиты" env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none apt-get install -y \
+    -o Dpkg::Options::="--force-confdef" \
+    -o Dpkg::Options::="--force-confold" \
+    curl wget gpg ca-certificates nano vim htop btop git unzip jq \
+    dnsutils iperf3 mtr-tiny iproute2 net-tools iptables ipset conntrack \
+    openssl python3 file
+}
+
+check_cpu_level() {
+  section "2/12 · Проверка CPU level"
+
+  local level
+  level="$(awk 'BEGIN{
+    while(!/flags/) if (getline<"/proc/cpuinfo"!=1) exit;
+    level=1;
+    if(/lm/&&/cmov/&&/cx16/&&/sse4_1/&&/sse4_2/&&/ssse3/&&/popcnt/) level=2;
+    if(level==2&&/avx/&&/avx2/&&/bmi1/&&/bmi2/&&/f16c/&&/fma/) level=3;
+    if(level==3&&/avx512f/&&/avx512bw/) level=4;
+    print "v"level
+  }')"
+
+  CPU_LEVEL="${level:-v1}"
+
+  ok "Detected CPU level: ${CPU_LEVEL}"
+
+  if [[ "$CPU_LEVEL" == "v1" || "$CPU_LEVEL" == "v2" ]]; then
+    warn "CPU level ${CPU_LEVEL} не поддерживает x64v3. Установка XanMod x64v3 ядра будет пропущена (на v1/v2 это ломает загрузку сервера)."
+  else
+    info "Ставим x64v3. Это обычно стабильнее для VPS."
+  fi
+
+  log_line "Detected CPU level: ${CPU_LEVEL}"
+}
+
+install_xanmod_kernel() {
+  section "3/12 · XanMod kernel $KERNEL_VER"
+
+  if [[ "$CPU_LEVEL" == "v1" || "$CPU_LEVEL" == "v2" ]]; then
+    KERNEL_INSTALL_SKIPPED=1
+    warn "Пропускаю установку XanMod x64v3 ядра: CPU level ${CPU_LEVEL:-unknown} ниже требуемого v3."
+    info "Сервер останется на текущем ядре, BBR v3 тюнинг сети при этом всё равно применится там, где это поддерживается текущим ядром."
+    return 0
+  fi
+
+  KERNEL_INSTALL_SKIPPED=0
+
+  if uname -r | grep -q "$KERNEL_VER"; then
+    ok "Уже загружено нужное ядро: $(uname -r)"
+    return 0
+  fi
+
+  mkdir -p /root/xanmod
+  cd /root/xanmod
+
+  rm -f ./*.deb
+
+  run_cmd "Скачиваю linux-image XanMod" \
+    curl -fL --retry 5 --retry-delay 2 --retry-all-errors -o image.deb "$IMAGE_DEB_URL"
+
+  run_cmd "Скачиваю linux-headers XanMod" \
+    curl -fL --retry 5 --retry-delay 2 --retry-all-errors -o headers.deb "$HEADERS_DEB_URL"
+
+  run_shell "Проверяю deb-пакеты" "file /root/xanmod/image.deb /root/xanmod/headers.deb && dpkg-deb -I /root/xanmod/image.deb >/dev/null && dpkg-deb -I /root/xanmod/headers.deb >/dev/null"
+
+  run_cmd "Устанавливаю XanMod kernel" env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" ./image.deb ./headers.deb
+  run_cmd "Обновляю GRUB" update-grub
+}
+
+install_profile_continue_hook() {
+  section "Автопродолжение после reboot"
+
+  cat > "$PROFILE_HOOK" <<EOF_HOOK
 #!/usr/bin/env bash
-set -Eeuo pipefail
 
-CONF="${CONF}"
-TRACE_URL="${TRACE_URL}"
-DENY_LOCS_DEFAULT="${DENY_LOCS}"
-ACCEPT_LOCS_DEFAULT="${ACCEPT_LOCS}"
-PREFERRED_LOCS_DEFAULT="${PREFERRED_LOCS}"
-AI_CHECK_DOMAINS_DEFAULT="${AI_CHECK_DOMAINS}"
-AI_CHECK_MIN_OK_TENTHS_DEFAULT="${AI_CHECK_MIN_OK_TENTHS}"
-DENY_LOCS="\${WARP_DENY_LOCS:-\${DENY_LOCS_DEFAULT}}"
-ACCEPT_LOCS="\${WARP_ACCEPT_LOCS:-\${ACCEPT_LOCS_DEFAULT}}"
-PREFERRED_LOCS="\${WARP_PREFERRED_LOCS:-\${PREFERRED_LOCS_DEFAULT}}"
-AI_CHECK_DOMAINS="\${WARP_AI_CHECK_DOMAINS:-\${AI_CHECK_DOMAINS_DEFAULT}}"
-AI_CHECK_MIN_OK_TENTHS="\${WARP_AI_CHECK_MIN_OK_TENTHS:-\${AI_CHECK_MIN_OK_TENTHS_DEFAULT}}"
-IFACE="${IFACE}"
+case "\$-" in
+  *i*) ;;
+  *) return 0 2>/dev/null || exit 0 ;;
+esac
 
-trace_field() {
-  local trace="\$1"
-  local field="\$2"
-  echo "\$trace" | awk -F= -v k="\$field" '\$1==k {print \$2; exit}'
-}
+tty -s || { return 0 2>/dev/null || exit 0; }
 
-csv_contains() {
-  local csv="\$1"
-  local needle="\$2"
-  [[ -z "\$csv" || -z "\$needle" ]] && return 1
-  IFS=',' read -ra arr <<< "\$csv"
-  for item in "\${arr[@]}"; do
-    item="\$(echo "\$item" | tr '[:lower:]' '[:upper:]' | xargs)"
-    [[ "\$item" == "\$needle" ]] && return 0
-  done
-  return 1
-}
+if [[ "\$EUID" -eq 0 ]] && [[ -f "$STATE_FILE" ]] && grep -qx 'need_post_reboot' "$STATE_FILE"; then
+  echo
+  echo "Eclipse Node Manager: найдено незавершённое продолжение после reboot."
+  echo "Обновляю скрипт из GitHub перед продолжением..."
 
-acceptable() {
-  local loc="\$1"
-  [[ -z "\$loc" ]] && return 1
-  loc="\$(echo "\$loc" | tr '[:lower:]' '[:upper:]')"
+  tmp="\$(mktemp "$SCRIPT_PATH.tmp.XXXXXX")"
 
-  if [[ -n "\$ACCEPT_LOCS" ]]; then
-    csv_contains "\$ACCEPT_LOCS" "\$loc" || return 1
+  if curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors \\
+    -H 'Cache-Control: no-cache' \\
+    -H 'Pragma: no-cache' \\
+    -o "\$tmp" \\
+    "$SELF_DOWNLOAD_URL?ts=\$(date +%s)" && bash -n "\$tmp"; then
+    mv -f "\$tmp" "$SCRIPT_PATH"
+    chmod 700 "$SCRIPT_PATH"
+    echo "Скрипт обновлён."
+  else
+    rm -f "\$tmp"
+    echo "Не удалось обновить скрипт. Продолжаю сохранённой копией."
   fi
 
-  if [[ -n "\$DENY_LOCS" ]]; then
-    csv_contains "\$DENY_LOCS" "\$loc" && return 1
+  "$SCRIPT_PATH" --continue
+fi
+EOF_HOOK
+
+  chmod 755 "$PROFILE_HOOK"
+  ok "Hook создан: $PROFILE_HOOK"
+}
+
+maybe_reboot() {
+  if [[ "$KERNEL_INSTALL_SKIPPED" -eq 1 ]]; then
+    ok "Ребут не требуется: установка XanMod ядра была пропущена (CPU level ${CPU_LEVEL:-unknown})."
+    return 0
   fi
 
-  return 0
+  if uname -r | grep -q "$KERNEL_VER"; then
+    ok "Ребут не нужен, уже загружено ядро $KERNEL_VER"
+    return 0
+  fi
+
+  set_state "need_post_reboot"
+  install_profile_continue_hook
+
+  echo
+  echo "${C_YELLOW}${C_BOLD}Первый этап завершён. Сейчас будет reboot.${C_RESET}"
+  echo "${C_DIM}После ребута зайди снова по SSH под root — скрипт сам продолжится и попросит SECRET_KEY.${C_RESET}"
+  echo
+
+  sleep 5
+  reboot
 }
 
-# Real end-to-end check: confirm chatgpt.com/claude.ai/gemini etc actually
-# answer through the warp interface, not just that Cloudflare's own trace
-# endpoint says warp=on/loc=OK. A WARP IP can be perfectly fine by
-# Cloudflare's own metric while being independently rate-limited/blocked by
-# the AI providers themselves (shared consumer WARP egress gets flagged).
-ai_domains_ok() {
-  local ok=0 total=0 code domain
-  for domain in \$AI_CHECK_DOMAINS; do
-    total=\$((total + 1))
-    code="\$(curl -4 --interface "\$IFACE" -o /dev/null -s -w '%{http_code}' \\
-      --max-time 6 --connect-timeout 5 "https://\${domain}/" 2>/dev/null)"
-    code="\${code:-000}"
-    [[ "\$code" =~ ^[0-9]{4,}\$ ]] && code="\${code: -3}"
-    [[ "\$code" != "000" ]] && ok=\$((ok + 1))
-  done
-  [[ "\$total" -eq 0 ]] && return 1
-  (( ok * 10 >= AI_CHECK_MIN_OK_TENTHS * total ))
+apply_network_tuning() {
+  section "4/12 · Сетевой тюнинг"
+
+  modprobe tcp_bbr >> "$LOG_FILE" 2>&1 || true
+
+  cat >/etc/sysctl.d/99-net-tuning.conf <<'EOF_SYSCTL'
+net.ipv4.tcp_congestion_control = bbr
+net.core.default_qdisc = fq
+
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
+net.core.rmem_default = 1048576
+net.core.wmem_default = 1048576
+net.core.optmem_max = 4194304
+
+net.ipv4.tcp_rmem = 4096 1048576 33554432
+net.ipv4.tcp_wmem = 4096 1048576 33554432
+net.ipv4.udp_rmem_min = 16384
+net.ipv4.udp_wmem_min = 16384
+
+net.core.netdev_max_backlog = 65536
+net.core.netdev_budget = 600
+net.core.somaxconn = 65535
+
+net.ipv4.tcp_max_syn_backlog = 65536
+net.ipv4.tcp_max_tw_buckets = 2000000
+net.ipv4.tcp_max_orphans = 262144
+
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_min_snd_mss = 512
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_notsent_lowat = 131072
+net.ipv4.tcp_no_metrics_save = 1
+net.ipv4.tcp_ecn = 1
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 10
+net.ipv4.tcp_keepalive_time = 600
+net.ipv4.tcp_keepalive_intvl = 30
+net.ipv4.tcp_keepalive_probes = 4
+
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.ip_forward = 1
+net.ipv4.conf.all.forwarding = 1
+net.ipv6.conf.all.forwarding = 1
+
+net.netfilter.nf_conntrack_max = 1048576
+net.netfilter.nf_conntrack_tcp_timeout_established = 7440
+
+fs.file-max = 2097152
+fs.nr_open = 2097152
+fs.inotify.max_user_watches = 1048576
+
+vm.swappiness = 10
+vm.overcommit_memory = 1
+vm.max_map_count = 262144
+vm.min_free_kbytes = 131072
+EOF_SYSCTL
+
+  run_cmd "Применяю sysctl параметры" sysctl --system
+
+  local cc qdisc
+  cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
+  qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"
+
+  ok "TCP congestion control: ${cc:-unknown}"
+  ok "Default qdisc: ${qdisc:-unknown}"
 }
 
-tr="\$(curl -4 --interface "\$IFACE" --max-time 8 -s "\$TRACE_URL" || true)"
-warp="\$(trace_field "\$tr" "warp")"
-loc="\$(trace_field "\$tr" "loc")"
+disable_thp() {
+  section "5/12 · Transparent Huge Pages"
 
-if [[ "\$warp" == "on" ]] && acceptable "\$loc" && ai_domains_ok; then
-  exit 0
-fi
-
-if [[ "\$warp" == "on" ]] && acceptable "\$loc"; then
-  logger -t warp-auto "WARP loc=\${loc:-empty} OK by Cloudflare, but AI domains unreachable through \$IFACE; rescanning"
-else
-  logger -t warp-auto "Bad WARP state: warp=\${warp:-empty} loc=\${loc:-empty}; rescanning endpoints"
-fi
-
-"${SELF_PATH_INSTALLED}" --rescan-only --deny="\${DENY_LOCS}" \${ACCEPT_LOCS:+--accept="\${ACCEPT_LOCS}"} \${PREFERRED_LOCS:+--prefer="\${PREFERRED_LOCS}"} --no-timer
-EOF_RECHECK
-
-  chmod +x /usr/local/sbin/warp-auto-recheck.sh
-
-  cat >/etc/systemd/system/warp-auto-recheck.service <<'EOF_SERVICE'
+  cat >/etc/systemd/system/disable-thp.service <<'EOF_SERVICE'
 [Unit]
-Description=Eclipse WARP egress location recheck
+Description=Disable Transparent Huge Pages
+After=multi-user.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/warp-auto-recheck.sh
-EOF_SERVICE
-
-  cat >/etc/systemd/system/warp-auto-recheck.timer <<EOF_TIMER
-[Unit]
-Description=Periodic Eclipse WARP egress location recheck
-
-[Timer]
-OnBootSec=2min
-OnUnitActiveSec=${WATCHDOG_INTERVAL_MIN}min
-AccuracySec=30sec
-Persistent=true
+ExecStart=/bin/sh -c 'echo never > /sys/kernel/mm/transparent_hugepage/enabled; echo never > /sys/kernel/mm/transparent_hugepage/defrag'
 
 [Install]
-WantedBy=timers.target
-EOF_TIMER
+WantedBy=multi-user.target
+EOF_SERVICE
 
-  systemctl daemon-reload
-  if systemctl enable --now warp-auto-recheck.timer >>"$LOG_FILE" 2>&1; then
-    say "Watchdog включён: warp-auto-recheck.timer (каждые ${WATCHDOG_INTERVAL_MIN} мин, проверяет loc + реальную доступность AI-доменов)"
-  else
-    warn "Не удалось включить watchdog timer. Смотри $LOG_FILE."
-  fi
+  run_cmd "Включаю disable-thp.service" systemctl daemon-reload
+  run_cmd "Отключаю THP" systemctl enable --now disable-thp.service
 
-  # Keep a copy of this script where the watchdog/menu can call it back,
-  # mirroring the old behaviour where uninstall removed /root/warp-auto-install.sh.
-  if [[ "$0" != "$SELF_PATH_INSTALLED" ]]; then
-    cp -f "$0" "$SELF_PATH_INSTALLED" 2>/dev/null && chmod +x "$SELF_PATH_INSTALLED" || true
-  fi
+  local thp
+  thp="$(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true)"
+  ok "THP: ${thp:-unknown}"
 }
 
-show_status() {
-  banner
-  step "Статус WARP"
+enable_rps() {
+  section "6/12 · RPS"
 
-  local direct direct_ip direct_loc direct_colo direct_warp
-  local wtrace wip wloc wcolo wwarp endpoint default_route timer region
+  local iface
+  iface="$(detect_iface)"
+  iface="${iface:-eth0}"
 
-  direct="$(trace_direct)"
-  direct_ip="$(trace_field "$direct" "ip")"
-  direct_loc="$(trace_field "$direct" "loc")"
-  direct_colo="$(trace_field "$direct" "colo")"
-  direct_warp="$(trace_field "$direct" "warp")"
-  region="$(server_region "${direct_loc:-UNKNOWN}")"
+  info "Основной интерфейс: $iface"
 
-  if ip link show "$IFACE" >/dev/null 2>&1; then
-    wtrace="$(trace_warp)"
-    wip="$(trace_field "$wtrace" "ip")"
-    wloc="$(trace_field "$wtrace" "loc")"
-    wcolo="$(trace_field "$wtrace" "colo")"
-    wwarp="$(trace_field "$wtrace" "warp")"
-  else
-    wip=""
-    wloc=""
-    wcolo=""
-    wwarp="interface-not-found"
-  fi
+  cat >/usr/local/sbin/enable-rps.sh <<'EOF_RPS'
+#!/usr/bin/env bash
+set -e
 
-  endpoint="$(grep '^Endpoint' "$CONF" 2>/dev/null | awk -F'= ' '{print $2}' || true)"
-  default_route="$(ip route | awk '/^default/ {print; exit}')"
-  timer="$(systemctl is-enabled warp-auto-recheck.timer 2>/dev/null || echo disabled)"
+IFACE="${1:-eth0}"
 
-  format_status_value "Server loc" "${direct_loc:-UNKNOWN} / ${region}"
-  format_status_value "Server IP" "$direct_ip"
-  format_status_value "Server colo" "$direct_colo"
-  format_status_value "Direct WARP" "$direct_warp"
-  line
-  format_status_value "Interface" "$IFACE"
-  format_status_value "Endpoint" "$endpoint"
-  format_status_value "WARP status" "$wwarp"
-  format_status_value "WARP loc" "$wloc"
-  format_status_value "WARP colo" "$wcolo"
-  format_status_value "WARP IP" "$wip"
-  format_status_value "Default route" "$default_route"
-  format_status_value "Timer" "$timer"
-  format_status_value "Log" "$LOG_FILE"
-  line
+MASK="$(python3 - <<'PY'
+import os
 
-  local ai_ok_state=0
-  if [[ "$wwarp" == "on" ]]; then
-    info "Проверка доступности AI-сервисов через $IFACE..."
-    local ai_result ai_ok ai_total ai_detail
-    ai_result="$(check_ai_domains_via_warp)"
-    ai_ok="$(echo "$ai_result" | awk '{print $1}')"
-    ai_total="$(echo "$ai_result" | awk '{print $2}')"
-    ai_detail="$(echo "$ai_result" | cut -d' ' -f3-)"
-    format_status_value "AI domains" "${ai_ok}/${ai_total} (${ai_detail})"
-    line
-    if (( ai_ok * 10 >= AI_CHECK_MIN_OK_TENTHS * ai_total )); then
-      ai_ok_state=1
-    fi
-  fi
+n = os.cpu_count() or 1
+mask = (1 << n) - 1
 
-  if [[ "$wwarp" == "on" ]] && warp_acceptable "$wloc" && [[ "$ai_ok_state" -eq 1 ]]; then
-    say "Состояние нормальное: WARP работает, loc допустимый, AI-сервисы отвечают."
-  elif [[ "$wwarp" == "on" ]] && warp_acceptable "$wloc"; then
-    warn "loc допустимый, но AI-сервисы плохо отвечают через этот endpoint — стоит пересканировать (пункт 2)."
-  else
-    warn "Состояние требует внимания: WARP выключен или loc недопустимый."
-  fi
+parts = []
+while mask:
+    parts.append(f"{mask & 0xffffffff:x}")
+    mask >>= 32
+
+print(",".join(parts) if parts else "1")
+PY
+)"
+
+echo "RPS iface: $IFACE"
+echo "RPS mask: $MASK"
+
+if [[ ! -d "/sys/class/net/$IFACE" ]]; then
+  echo "Interface $IFACE not found"
+  exit 0
+fi
+
+for q in /sys/class/net/"$IFACE"/queues/rx-*/rps_cpus; do
+  [[ -e "$q" ]] || continue
+  echo "$MASK" > "$q" || true
+done
+
+for q in /sys/class/net/"$IFACE"/queues/rx-*/rps_flow_cnt; do
+  [[ -e "$q" ]] || continue
+  echo 32768 > "$q" || true
+done
+
+echo 32768 > /proc/sys/net/core/rps_sock_flow_entries || true
+
+cat /sys/class/net/"$IFACE"/queues/rx-*/rps_cpus 2>/dev/null || true
+EOF_RPS
+
+  chmod +x /usr/local/sbin/enable-rps.sh
+
+  cat >/etc/systemd/system/na-rps-lite.service <<EOF_SERVICE
+[Unit]
+Description=Enable RPS dynamically
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/enable-rps.sh $iface
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF_SERVICE
+
+  run_cmd "Перезагружаю systemd" systemctl daemon-reload
+  run_cmd "Включаю RPS" systemctl enable --now na-rps-lite.service
+
+  ok "RPS настроен для $iface"
 }
 
-print_final_summary() {
-  banner
-  step "Итог установки"
+install_docker() {
+  section "7/12 · Docker"
 
-  local direct_loc region warpstat endpoint default_route timer
-  direct_loc="$(server_country)"
-  region="$(server_region "${direct_loc:-UNKNOWN}")"
-  warpstat="$(current_warp_status_line)"
-  endpoint="$(grep '^Endpoint' "$CONF" 2>/dev/null | awk -F'= ' '{print $2}' || true)"
-  default_route="$(ip route | awk '/^default/ {print; exit}')"
-  timer="$(systemctl is-enabled warp-auto-recheck.timer 2>/dev/null || echo disabled)"
-
-  format_status_value "Server loc" "${direct_loc:-UNKNOWN} / ${region}"
-  format_status_value "WireGuard iface" "$IFACE"
-  format_status_value "Endpoint" "$endpoint"
-  format_status_value "Config" "$CONF"
-  format_status_value "Default route" "$default_route"
-  format_status_value "WARP trace" "$warpstat"
-  format_status_value "Timer" "$timer"
-  format_status_value "Log" "$LOG_FILE"
-
-  if ip link show "$IFACE" >/dev/null 2>&1; then
-    local ai_result ai_ok ai_total ai_detail
-    ai_result="$(check_ai_domains_via_warp)"
-    ai_ok="$(echo "$ai_result" | awk '{print $1}')"
-    ai_total="$(echo "$ai_result" | awk '{print $2}')"
-    ai_detail="$(echo "$ai_result" | cut -d' ' -f3-)"
-    format_status_value "AI domains" "${ai_ok}/${ai_total} (${ai_detail})"
+  if ! command -v docker >/dev/null 2>&1; then
+    run_shell "Устанавливаю Docker" "curl -fsSL https://get.docker.com | sh"
+  else
+    ok "Docker уже установлен"
   fi
 
-  line
-  printf "${WHITE}${BOLD}Remnawave/Xray outbound (добавь в outbounds):${RESET}\n\n"
-  cat <<'EOF'
+  mkdir -p /etc/docker
+
+  cat >/etc/docker/daemon.json <<'EOF_DOCKER'
 {
-  "tag": "warp-out",
-  "protocol": "freedom",
-  "settings": {
-    "domainStrategy": "UseIPv4"
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "100m",
+    "max-file": "5"
   },
-  "streamSettings": {
-    "sockopt": {
-      "interface": "warp",
-      "tcpFastOpen": true
+  "default-ulimits": {
+    "nofile": {
+      "Name": "nofile",
+      "Hard": 1048576,
+      "Soft": 1048576
+    },
+    "nproc": {
+      "Name": "nproc",
+      "Hard": 1048576,
+      "Soft": 1048576
     }
-  }
+  },
+  "live-restore": true
 }
-EOF
+EOF_DOCKER
 
-  printf "\n${WHITE}${BOLD}Routing rule (добавь В НАЧАЛО списка rules, до общих правил):${RESET}\n\n"
-  cat <<'EOF'
-{
-  "type": "field",
-  "domain": [
-    "domain:chatgpt.com",
-    "domain:openai.com",
-    "domain:oaistatic.com",
-    "domain:oaiusercontent.com",
-    "domain:oaistatsig.com",
-    "domain:openaimerge.com",
-    "domain:intercom.io",
-    "domain:intercomcdn.com",
-    "domain:ct.sendgrid.net",
-    "domain:sora.com",
-    "domain:claude.ai",
-    "domain:claude.com",
-    "domain:anthropic.com",
-    "domain:gemini.google.com",
-    "domain:gemini.google",
-    "domain:aistudio.google.com",
-    "domain:ai.google.dev",
-    "full:generativelanguage.googleapis.com",
-    "domain:makersuite.google.com",
-    "domain:notebooklm.google",
-    "domain:notebooklm.google.com",
-    "domain:labs.google",
-    "domain:flow.google",
-    "domain:codeassist.google",
-    "domain:copilot.microsoft.com",
-    "domain:copilot.cloud.microsoft",
-    "domain:m365.cloud.microsoft",
-    "domain:bing.com",
-    "domain:bingsandbox.com",
-    "domain:perplexity.ai",
-    "domain:pplx.ai",
-    "domain:perplexity.com",
-    "domain:mistral.ai",
-    "domain:chat.mistral.ai",
-    "domain:console.mistral.ai",
-    "domain:api.mistral.ai",
-    "domain:deepseek.com",
-    "domain:chat.deepseek.com",
-    "domain:api.deepseek.com",
-    "domain:grok.com",
-    "domain:x.ai",
-    "full:api.x.ai",
-    "domain:meta.ai",
-    "domain:ai.meta.com",
-    "domain:llama.com",
-    "domain:poe.com",
-    "domain:character.ai",
-    "domain:huggingface.co",
-    "domain:hf.co",
-    "domain:hf.space",
-    "domain:huggingfacecdn.com",
-    "domain:you.com",
-    "domain:phind.com",
-    "domain:cursor.com",
-    "domain:cursor.sh",
-    "domain:anysphere.co",
-    "domain:windsurf.com",
-    "domain:codeium.com",
-    "domain:replit.com"
-  ],
-  "outboundTag": "warp-out"
-}
-EOF
+  run_cmd "Включаю Docker" systemctl enable docker
+  run_cmd "Перезапускаю Docker" systemctl restart docker
 
-  printf "\n${WHITE}${BOLD}Проверки:${RESET}\n"
-  cat <<'EOF'
-  ip route
-  wg show warp
-  curl -4 --interface warp https://www.cloudflare.com/cdn-cgi/trace
-  curl -4 https://www.cloudflare.com/cdn-cgi/trace
-  curl -4 --interface warp -o /dev/null -s -w '%{http_code}\n' https://chatgpt.com/
-  curl -4 --interface warp -o /dev/null -s -w '%{http_code}\n' https://claude.ai/
-  curl -4 --interface warp -o /dev/null -s -w '%{http_code}\n' https://gemini.google.com/
-EOF
+  local docker_v compose_v
+  docker_v="$(docker --version 2>/dev/null || true)"
+  compose_v="$(docker_compose version 2>/dev/null | head -n 1 || true)"
+
+  ok "${docker_v:-Docker установлен}"
+  ok "${compose_v:-Docker Compose доступен}"
 }
 
-manual_page() {
-  banner
-  cat <<'EOF'
-Ручная установка WARP через wgcf + wg-quick
+disable_llmnr() {
+  section "8/12 · Закрытие LLMNR / 5355"
 
-1. Пакеты:
-   apt update
-   apt install -y wireguard-tools curl jq ca-certificates iproute2
+  mkdir -p /etc/systemd/resolved.conf.d
 
-2. Скачать wgcf:
-   WGCF_URL="$(curl -fsSL https://api.github.com/repos/ViRb3/wgcf/releases/latest | jq -r '.assets[] | select(.name | test("linux_amd64$")) | .browser_download_url' | head -n1)"
-   curl -fL "$WGCF_URL" -o /usr/local/bin/wgcf
-   chmod +x /usr/local/bin/wgcf
+  cat >/etc/systemd/resolved.conf.d/99-no-llmnr.conf <<'EOF_RESOLVED'
+[Resolve]
+LLMNR=no
+MulticastDNS=no
+EOF_RESOLVED
 
-3. Создать WARP профиль:
-   mkdir -p /etc/wireguard
-   cd /etc/wireguard
-   wgcf register
-   wgcf generate
-   cp wgcf-profile.conf warp.conf
-   chmod 600 warp.conf
+  systemctl restart systemd-resolved >> "$LOG_FILE" 2>&1 || true
 
-4. Безопасные правки:
-   sed -i '/^\[Interface\]/a Table = off' /etc/wireguard/warp.conf
-   sed -i '/^DNS =/d' /etc/wireguard/warp.conf
-
-5. Поднять:
-   systemctl enable --now wg-quick@warp
-
-6. Проверить:
-   ip route
-   wg show warp
-   curl -4 --interface warp https://www.cloudflare.com/cdn-cgi/trace
-EOF
-}
-
-uninstall_warp() {
-  banner
-  step "Удаление WARP Manager"
-
-  systemctl disable --now warp-auto-recheck.timer >/dev/null 2>&1 || true
-  systemctl disable --now "wg-quick@${IFACE}" >/dev/null 2>&1 || true
-
-  rm -f /etc/systemd/system/warp-auto-recheck.timer
-  rm -f /etc/systemd/system/warp-auto-recheck.service
-  rm -f /usr/local/sbin/warp-auto-recheck.sh
-  rm -f "$SELF_PATH_INSTALLED"
-
-  systemctl daemon-reload
-
-  warn "Конфиги WireGuard не удалены автоматически: $WG_DIR"
-  warn "Если надо удалить полностью: rm -f ${CONF} ${WG_DIR}/wgcf-*"
-  say "Сервисы отключены."
-}
-
-auto_install() {
-  banner
-
-  local c region
-  c="$(server_country)"
-  region="$(server_region "$c")"
-
-  step "Проверка сервера"
-  format_status_value "Country" "$c"
-  format_status_value "Region" "$region"
-  format_status_value "Preferred locs" "${PREFERRED_LOCS:-нет}"
-  format_status_value "Deny locs" "$DENY_LOCS"
-  format_status_value "Accept locs" "${ACCEPT_LOCS:-any except denied}"
-  format_status_value "Log" "$LOG_FILE"
-
-  install_deps
-  download_wgcf
-  create_profile
-  ensure_safe_conf
-  start_warp
-
-  if ! scan_endpoints; then
-    fail "WARP установлен, но допустимый egress loc не найден."
-    print_final_summary || true
-    exit 2
+  if ss -tulpen | grep -q 5355; then
+    warn "5355 всё ещё слушается. Проверь systemd-resolved вручную."
+  else
+    ok "5355 закрыт"
   fi
-
-  install_watchdog
-  print_final_summary
 }
 
-menu() {
-  while true; do
-    banner
-    printf "${WHITE}${BOLD}Выбери действие:${RESET}\n\n"
-    printf "  ${GREEN}1)${RESET} Автоматическая установка WARP\n"
-    printf "  ${GREEN}2)${RESET} Пересканировать WARP endpoints (US-приоритет)\n"
-    printf "  ${GREEN}3)${RESET} Статус WARP\n"
-    printf "  ${GREEN}4)${RESET} Проверить доступность AI-сервисов через WARP\n"
-    printf "  ${GREEN}5)${RESET} Ручная инструкция\n"
-    printf "  ${GREEN}6)${RESET} Удалить/отключить WARP Manager\n"
-    printf "  ${GREEN}0)${RESET} Выход\n"
-    printf "\n${GRAY}Настройки сейчас: prefer=%s, deny=%s, accept=%s, iface=%s${RESET}\n" \
-      "${PREFERRED_LOCS:-none}" "${DENY_LOCS:-none}" "${ACCEPT_LOCS:-any}" "$IFACE"
-    printf "\nВведите номер: "
-    read -r choice || true
+run_final_test() {
+  section "9/12 · Проверка системы"
 
-    case "$choice" in
-      1) MODE="auto"; auto_install; pause_enter ;;
-      2) MODE="rescan"; RESCAN_ONLY=1; require_root; ensure_safe_conf; start_warp; scan_endpoints; print_final_summary; pause_enter ;;
-      3) show_status; pause_enter ;;
-      4)
-        banner
-        step "Проверка AI-сервисов через $IFACE"
-        if ! ip link show "$IFACE" >/dev/null 2>&1; then
-          fail "Интерфейс $IFACE не найден. Сначала установи WARP (пункт 1)."
-        else
-          local ai_result ai_ok ai_total ai_detail
-          ai_result="$(check_ai_domains_via_warp)"
-          ai_ok="$(echo "$ai_result" | awk '{print $1}')"
-          ai_total="$(echo "$ai_result" | awk '{print $2}')"
-          ai_detail="$(echo "$ai_result" | cut -d' ' -f3-)"
-          for pair in $ai_detail; do
-            local d="${pair%=*}" c="${pair#*=}"
-            if [[ "$c" == "000" ]]; then
-              fail "$d -> нет соединения"
-            else
-              say "$d -> HTTP $c"
-            fi
-          done
-          line
-          if (( ai_ok * 10 >= AI_CHECK_MIN_OK_TENTHS * ai_total )); then
-            say "Итог: ${ai_ok}/${ai_total} доменов доступны — норма."
-          else
-            warn "Итог: ${ai_ok}/${ai_total} доменов доступны — мало, стоит пересканировать (пункт 2)."
-          fi
-        fi
-        pause_enter
-        ;;
-      5) manual_page; pause_enter ;;
-      6) uninstall_warp; pause_enter ;;
-      0) exit 0 ;;
-      *) warn "Неверный пункт меню"; sleep 1 ;;
-    esac
-  done
+  local kernel cc qdisc
+  kernel="$(uname -r)"
+  cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
+  qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"
+
+  {
+    echo "uname -r:"
+    uname -r
+
+    echo
+    sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc net.ipv4.tcp_min_snd_mss || true
+
+    echo
+    echo "BBR version:"
+    cat /sys/module/tcp_bbr/version 2>/dev/null || true
+
+    echo
+    echo "THP:"
+    cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true
+
+    echo
+    echo "Docker:"
+    docker version || true
+
+    echo
+    echo "Docker Compose:"
+    docker_compose version || true
+
+    echo
+    echo "Listening sockets:"
+    ss -tulpen || true
+  } >> "$LOG_FILE" 2>&1
+
+  ok "Kernel: $kernel"
+  ok "TCP CC: ${cc:-unknown}"
+  ok "Qdisc: ${qdisc:-unknown}"
 }
 
-main() {
-  require_root
+optional_speedtest() {
+  section "10/12 · Speedtest"
 
-  case "$MODE" in
-    auto) auto_install ;;
-    menu) menu ;;
-    manual) manual_page ;;
-    status) show_status ;;
-    rescan)
-      banner
-      ensure_safe_conf
-      start_warp
-      scan_endpoints
-      print_final_summary
+  echo
+  read -rp "  Запустить iperf3 speedtest сейчас? [y/N]: " ans
+
+  case "${ans,,}" in
+    y|yes|д|да)
+      echo
+      echo "${C_DIM}  TCP counters before:${C_RESET}"
+      nstat -az TcpRetransSegs TcpOutSegs 2>/dev/null | tee -a "$LOG_FILE" | sed 's/^/  /' || true
+
+      if run_shell_live "Запускаю iperf3 speedtest" \
+        "bash <(wget -qO- https://github.com/itdoginfo/russian-iperf3-servers/raw/main/speedtest.sh)"; then
+        :
+      else
+        warn "Speedtest завершился с ошибкой, но это не критично — продолжаю установку."
+      fi
+
+      echo
+      echo "${C_DIM}  TCP counters after:${C_RESET}"
+      nstat -az TcpRetransSegs TcpOutSegs 2>/dev/null | tee -a "$LOG_FILE" | sed 's/^/  /' || true
       ;;
-    uninstall) uninstall_warp ;;
-    *) fail "Unknown mode: $MODE"; exit 1 ;;
+    *)
+      ok "Speedtest пропущен"
+      ;;
   esac
 }
 
-main "$@"
+optional_selfsteal() {
+  section "11/12 · Selfsteal"
+
+  echo
+  read -rp "  Запустить selfsteal.sh сейчас? [y/N]: " ans
+
+  case "${ans,,}" in
+    y|yes|д|да)
+      if run_shell_live "Запускаю selfsteal.sh" "bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh)"; then
+        ok "Selfsteal завершён, продолжаю установку ноды."
+      else
+        warn "Selfsteal.sh вернул ненулевой код (это может быть нормально для его собственной логики). Продолжаю установку ноды — её настройка дальше не зависит от selfsteal."
+      fi
+      ;;
+    *)
+      ok "Selfsteal пропущен"
+      ;;
+  esac
+}
+
+run_warp_setup() {
+  section "Настройка WARP"
+  info "Запускаю Eclipse WARP Manager (отдельный скрипт, своё меню)."
+  info "Репозиторий: https://github.com/blantxxv/warp"
+  echo
+
+  if bash -c "bash <(curl -fsSL '$WARP_INSTALL_URL')"; then
+    ok "Eclipse WARP Manager завершил работу."
+  else
+    warn "Eclipse WARP Manager завершился с ошибкой или был прерван. Подробности — в его собственном логе: /var/log/warp-auto-install.log"
+  fi
+}
+
+sanitize_node_name() {
+  local raw="$1"
+
+  raw="${raw:-Unknown}"
+  raw="$(echo "$raw" | tr -cd '[:alnum:] ._-' | sed -E 's/[[:space:]_]+/-/g; s/^-+//; s/-+$//')"
+
+  if [[ -z "$raw" ]]; then
+    raw="Unknown"
+  fi
+
+  echo "$raw"
+}
+
+sanitize_compose_name() {
+  local raw="$1"
+
+  raw="${raw:-remnanode}"
+  raw="$(echo "$raw" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')"
+
+  if [[ -z "$raw" ]]; then
+    raw="remnanode"
+  fi
+
+  echo "$raw"
+}
+
+detect_country_name() {
+  local country=""
+
+  country="$(curl -fsSL --connect-timeout 4 --max-time 8 https://ipapi.co/country_name/ 2>/dev/null | head -n 1 | tr -d '\r' || true)"
+
+  if [[ -z "$country" || "$country" == "Undefined" || "$country" == "Reserved" ]]; then
+    country="$(curl -fsSL --connect-timeout 4 --max-time 8 https://ifconfig.co/country 2>/dev/null | head -n 1 | tr -d '\r' || true)"
+  fi
+
+  if [[ -z "$country" ]]; then
+    country="Unknown"
+  fi
+
+  echo "$country"
+}
+
+ask_node_port() {
+  local input=""
+
+  while true; do
+    read -rp "  NODE_PORT [${DEFAULT_NODE_PORT}]: " input
+    input="${input:-$DEFAULT_NODE_PORT}"
+
+    if [[ "$input" =~ ^[0-9]+$ ]] && (( input >= 1 && input <= 65535 )); then
+      NODE_PORT="$input"
+      ok "Порт ноды: $NODE_PORT"
+      return 0
+    fi
+
+    warn "Некорректный порт. Нужно число от 1 до 65535."
+  done
+}
+
+prepare_node_paths() {
+  local detected_country country_slug suffix base_dir compose_slug
+
+  detected_country="$(detect_country_name)"
+  country_slug="$(sanitize_node_name "$detected_country")"
+
+  base_dir="/opt/${country_slug}-Node"
+
+  if [[ -e "$base_dir" ]]; then
+    suffix="$(tr -dc 'a-z0-9' </dev/urandom | head -c 4 || true)"
+    suffix="${suffix:-$RANDOM}"
+    REMNANODE_DIR="${base_dir}-${suffix}"
+  else
+    REMNANODE_DIR="$base_dir"
+  fi
+
+  NODE_DISPLAY_NAME="$(basename "$REMNANODE_DIR")"
+  compose_slug="$(sanitize_compose_name "$NODE_DISPLAY_NAME")"
+
+  COMPOSE_PROJECT_NAME="$compose_slug"
+  CONTAINER_NAME="$compose_slug"
+  REMNANODE_LOG_DIR="$REMNANODE_DIR/logs"
+
+  ok "Страна сервера: $detected_country"
+  ok "Папка ноды: $REMNANODE_DIR"
+  ok "Папка логов: $REMNANODE_LOG_DIR"
+  ok "Контейнер: $CONTAINER_NAME"
+}
+
+setup_remnanode() {
+  section "12/12 · Remnawave Node"
+
+  prepare_node_paths
+  ask_node_port
+
+  echo
+  echo "  Вставь SECRET_KEY из панели Remnawave."
+  echo "  Ввод скрытый, это нормально."
+  read -rsp "  SECRET_KEY: " SECRET_KEY
+  echo
+
+  [[ -n "${SECRET_KEY:-}" ]] || die "SECRET_KEY пустой."
+
+  mkdir -p "$REMNANODE_DIR" "$REMNANODE_LOG_DIR"
+  cd "$REMNANODE_DIR"
+
+  run_cmd "Скачиваю geosite.dat" \
+    curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors \
+    -o geosite.dat \
+    https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat
+
+  run_cmd "Скачиваю geoip.dat" \
+    curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors \
+    -o geoip.dat \
+    https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat
+
+  touch "$REMNANODE_LOG_DIR/access.log" "$REMNANODE_LOG_DIR/error.log"
+
+  cat > "$REMNANODE_DIR/.env" <<EOF_ENV
+NODE_PORT=$NODE_PORT
+SECRET_KEY=$SECRET_KEY
+EOF_ENV
+
+  chmod 600 "$REMNANODE_DIR/.env"
+
+  cat > "$REMNANODE_DIR/docker-compose.yml" <<EOF_COMPOSE
+name: $COMPOSE_PROJECT_NAME
+
+services:
+  remnanode:
+    container_name: $CONTAINER_NAME
+    hostname: $CONTAINER_NAME
+    image: remnawave/node:latest
+    network_mode: host
+    restart: always
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ./geosite.dat:/usr/local/share/xray/geosite.dat:ro
+      - ./geoip.dat:/usr/local/share/xray/geoip.dat:ro
+      - ./logs:/var/log/remnanode
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    env_file:
+      - .env
+EOF_COMPOSE
+
+  run_cmd "Запускаю Remnawave Node" docker_compose up -d
+
+  docker_compose ps >> "$LOG_FILE" 2>&1 || true
+  docker_compose logs --tail=100 >> "$LOG_FILE" 2>&1 || true
+
+  if ss -tulpen | grep -q ":$NODE_PORT"; then
+    ok "Порт $NODE_PORT слушается"
+  else
+    warn "Порт $NODE_PORT не слушается. Проверь: cd $REMNANODE_DIR && docker compose logs -f --tail=100"
+  fi
+}
+
+cleanup_continue_hook() {
+  rm -f "$PROFILE_HOOK"
+  set_state "done"
+}
+
+stage_before_reboot() {
+  need_root
+  print_banner
+  save_self
+
+  mkdir -p "$STATE_DIR"
+  touch "$LOG_FILE"
+
+  warn "Перед установкой ядра убедись, что у VPS есть VNC/Rescue-консоль на случай, если сервер не загрузится после reboot."
+
+  echo
+  read -rp "  Продолжить установку? [y/N]: " ans
+
+  case "${ans,,}" in
+    y|yes|д|да) ;;
+    *) die "Отменено пользователем." ;;
+  esac
+
+  install_base_packages
+  check_cpu_level
+  install_xanmod_kernel
+  maybe_reboot
+
+  stage_after_reboot
+}
+
+stage_after_reboot() {
+  need_root
+  print_banner
+
+  mkdir -p "$STATE_DIR"
+  touch "$LOG_FILE"
+
+  section "Продолжение установки после reboot"
+
+  if ! uname -r | grep -q "$KERNEL_VER"; then
+    warn "Сейчас загружено ядро: $(uname -r)"
+    warn "Ожидалось: $KERNEL_VER"
+    warn "Продолжаю настройку, но BBR v3 может быть недоступен."
+  else
+    ok "Загружено ядро: $(uname -r)"
+  fi
+
+  apply_network_tuning
+  disable_thp
+  enable_rps
+  install_docker
+  disable_llmnr
+  run_final_test
+  optional_speedtest
+  optional_selfsteal
+  setup_remnanode
+  cleanup_continue_hook
+
+  echo
+  echo "${C_GREEN}${C_BOLD}╔══════════════════════════════════════════════════════════════╗"
+  echo "║                         ГОТОВО                               ║"
+  echo "╚══════════════════════════════════════════════════════════════╝${C_RESET}"
+  echo
+  echo "  Лог установки: $LOG_FILE"
+  echo
+  echo "  Remnawave Node:"
+  echo "    cd $REMNANODE_DIR"
+  echo "    docker compose ps"
+  echo "    docker compose logs -f --tail=100"
+  echo
+}
+
+print_manual_mode() {
+  print_banner
+
+  cat <<EOF_MANUAL
+${C_BOLD}Ручная установка${C_RESET}
+
+Вариант без автоматического скрипта: выполняй команды из README по разделам.
+
+README:
+  https://github.com/blantxxv/bbr3
+
+Основные этапы:
+  1. Базовые пакеты
+  2. Проверка CPU level
+  3. Установка XanMod kernel
+  4. Reboot
+  5. BBR / сетевой тюнинг
+  6. Docker
+  7. Remnawave Node в папке по стране сервера
+  8. Выбор порта и динамическое имя контейнера
+  9. Финальная проверка
+
+Быстро открыть README на сервере можно так:
+
+  curl -fL https://raw.githubusercontent.com/blantxxv/bbr3/main/README.md | less
+
+EOF_MANUAL
+}
+
+main_menu() {
+  need_root
+  print_banner
+
+  notify_if_update_available
+
+  echo "${C_BOLD}Выбери режим:${C_RESET}"
+  echo
+  echo "  ${C_GREEN}1${C_RESET}) Автоматическая установка"
+  echo "  ${C_CYAN}2${C_RESET}) Ручная установка: показать README/команды"
+  echo "  ${C_CYAN}3${C_RESET}) Настройка WARP"
+  echo "  ${C_CYAN}4${C_RESET}) Проверить обновления"
+  echo "  ${C_YELLOW}5${C_RESET}) Выход"
+  echo
+
+  read -rp "  Выбор [1/2/3/4/5]: " choice
+
+  case "${choice:-}" in
+    1)
+      stage_before_reboot
+      ;;
+    2)
+      print_manual_mode
+      ;;
+    3)
+      run_warp_setup
+      ;;
+    4)
+      check_for_updates
+      ;;
+    5)
+      echo "Выход."
+      ;;
+    *)
+      die "Неверный выбор."
+      ;;
+  esac
+}
+
+case "${1:-}" in
+  --continue)
+    stage_after_reboot
+    ;;
+  --auto)
+    stage_before_reboot
+    ;;
+  --manual)
+    print_manual_mode
+    ;;
+  --warp)
+    need_root
+    run_warp_setup
+    ;;
+  --check-update)
+    need_root
+    check_for_updates
+    ;;
+  *)
+    main_menu
+    ;;
+esac
