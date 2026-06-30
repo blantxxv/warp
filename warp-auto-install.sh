@@ -547,8 +547,18 @@ check_ai_domains_via_warp() {
   local domain code
   for domain in $AI_CHECK_DOMAINS; do
     total=$((total + 1))
+    # curl with -w '%{http_code}' prints "000" itself on a connect-level
+    # failure (timeout, refused, no route) AND still returns a non-zero
+    # exit code — so a naive `|| echo "000"` fallback double-prints,
+    # producing "000000". Just read curl's own %{http_code} output and
+    # ignore curl's exit status; fall back to "000" only if curl produced
+    # no output at all (e.g. it crashed before writing anything).
     code="$(curl -4 --interface "$IFACE" -o /dev/null -s -w '%{http_code}' \
-      --max-time 6 --connect-timeout 5 "https://${domain}/" 2>/dev/null || echo "000")"
+      --max-time 6 --connect-timeout 5 "https://${domain}/" 2>/dev/null)"
+    code="${code:-000}"
+    # Defensive: if anything still produced a doubled/garbled value, keep
+    # only the last 3 digits so downstream comparisons stay well-formed.
+    [[ "$code" =~ ^[0-9]{4,}$ ]] && code="${code: -3}"
     # Anything that isn't a connection-level failure counts as "reachable":
     # AI sites legitimately answer with 200/301/302/403 (region/bot pages)
     # without that meaning the tunnel is broken — 000 means curl couldn't
@@ -813,12 +823,57 @@ scan_endpoints() {
   if [[ -n "$best_endpoint" ]]; then
     warn "Лучший найденный вариант был loc=$best_loc на $best_endpoint, но это запрещённый/не разрешённый лок."
   else
-    warn "Ни один endpoint не дал успешный handshake — возможно блокируется UDP исходящий трафик."
+    warn "Ни один endpoint не дал успешный handshake (0 успехов из $n) — похоже на блокировку исходящего UDP."
+    diagnose_udp_block
   fi
   info "Восстанавливаю предыдущий конфиг."
   cp "$backup" "$CONF"
   systemctl restart "wg-quick@${IFACE}" >/dev/null 2>&1 || true
   return 1
+}
+
+# Runs when NOT A SINGLE probed endpoint produced a handshake. Distinguishes
+# "this whole server's outbound UDP is filtered" (hosting provider firewall,
+# common on budget VPS) from "just these specific Cloudflare IPs are bad"
+# so the user isn't left guessing why 60/60 probes failed identically.
+diagnose_udp_block() {
+  info "Диагностика исходящего UDP..."
+
+  # 1) Can we even reach Cloudflare's anycast IP for the *trace* endpoint
+  #    over plain TCP/443? If this also fails, it's likely outbound
+  #    filtering in general, not something specific to UDP/WireGuard.
+  if curl -4 --max-time 5 -s -o /dev/null "https://1.1.1.1/cdn-cgi/trace" 2>/dev/null; then
+    say "TCP/443 до Cloudflare (1.1.1.1) работает — значит блокировка не на TCP-уровне."
+  else
+    warn "Даже TCP/443 до Cloudflare (1.1.1.1) не проходит — проблема шире, не только WARP/UDP."
+  fi
+
+  # 2) Direct UDP reachability test against the WARP port itself, bypassing
+  #    WireGuard entirely — a raw UDP packet to a known-good Cloudflare WARP
+  #    IP. If this also gets nothing back, outbound UDP is filtered at the
+  #    host/network level (provider firewall, security group, iptables).
+  if command -v nc >/dev/null 2>&1; then
+    if timeout 5 bash -c "echo -n '' | nc -4u -w3 162.159.192.1 2408" 2>/dev/null; then
+      info "UDP/2408 пакет до 162.159.192.1 отправлен без немедленной ошибки (не гарантирует ответ, но порт не закрыт локально)."
+    else
+      warn "Не удалось даже отправить UDP-пакет на 162.159.192.1:2408 — возможно iptables/security group режут исходящий UDP локально."
+    fi
+  fi
+
+  # 3) Look for an obviously restrictive local firewall (common cause when
+  #    a VPS panel auto-applies an inbound-only iptables/nft profile that
+  #    also accidentally affects outbound UDP via default-deny chains).
+  if command -v iptables >/dev/null 2>&1; then
+    local udp_drop
+    udp_drop="$(iptables -L OUTPUT -n 2>/dev/null | grep -i 'udp' | grep -iE 'drop|reject' || true)"
+    if [[ -n "$udp_drop" ]]; then
+      warn "Найдены DROP/REJECT правила для UDP в OUTPUT chain — это может блокировать WARP:"
+      printf '%s\n' "$udp_drop" | while IFS= read -r l; do warn "  $l"; done
+    fi
+  fi
+
+  info "Если оба теста (TCP и UDP) выше провалились — почти наверняка хостер/датацентр режет исходящий трафик нестандартными способами."
+  info "Если TCP работает, а UDP нет — проси хостера открыть исходящий UDP (включая порты 2408, 500, 1701, 4500) или проверь security group/firewall в панели хостера."
 }
 
 install_watchdog() {
@@ -888,7 +943,9 @@ ai_domains_ok() {
   for domain in \$AI_CHECK_DOMAINS; do
     total=\$((total + 1))
     code="\$(curl -4 --interface "\$IFACE" -o /dev/null -s -w '%{http_code}' \\
-      --max-time 6 --connect-timeout 5 "https://\${domain}/" 2>/dev/null || echo "000")"
+      --max-time 6 --connect-timeout 5 "https://\${domain}/" 2>/dev/null)"
+    code="\${code:-000}"
+    [[ "\$code" =~ ^[0-9]{4,}\$ ]] && code="\${code: -3}"
     [[ "\$code" != "000" ]] && ok=\$((ok + 1))
   done
   [[ "\$total" -eq 0 ]] && return 1
