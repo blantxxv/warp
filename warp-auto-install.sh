@@ -56,6 +56,14 @@ ENDPOINT_IPS="${WARP_ENDPOINT_IPS:-}"
 MAX_PROBES="${WARP_MAX_PROBES:-60}"
 HANDSHAKE_WAIT="${WARP_HANDSHAKE_WAIT:-3}"
 
+# Optional pause between probes. Anti-torrent/DPI daemons that watch for
+# P2P-style behaviour (many short-lived connections to many different IPs
+# in a short window — exactly what a fast scan looks like) may flag/ban
+# based on burst rate. A small inter-probe delay can dodge that heuristic
+# without meaningfully slowing down a human-supervised scan. 0 = old
+# behaviour (no delay).
+PROBE_DELAY_MS="${WARP_PROBE_DELAY_MS:-0}"
+
 # Preferred loc(s) for AI access (US gives the broadest, least-filtered
 # access to ChatGPT/Claude/Gemini/etc). Scan phase 1 spends up to
 # PREFERRED_BUDGET probes hunting ONLY for these locs; if that budget runs
@@ -229,6 +237,8 @@ Options:
   --accept=DE,PL,BR    Optional allowed WARP loc values. Empty = accept any not denied
   --prefer=US          Preferred loc(s), tried first. Default: US
   --watchdog-interval=5  Minutes between watchdog rechecks. Default: 5
+  --slow-scan          Add ~800ms delay between probes (dodges anti-torrent/DPI burst detectors)
+  --probe-delay=MS     Custom delay between probes in milliseconds. Default: 0
   --no-timer           Do not install watchdog timer
   --debug              Show executed shell commands
   -h, --help           Show help
@@ -239,6 +249,7 @@ Environment:
   WARP_PREFERRED_LOCS      Same as --prefer. Default: US
   WARP_PREFERRED_BUDGET    Probes spent hunting preferred loc before fallback. Default: 40
   WARP_WATCHDOG_INTERVAL_MIN  Minutes between watchdog rechecks. Default: 5
+  WARP_PROBE_DELAY_MS      Delay between scan probes in ms. Default: 0 (see --slow-scan)
   WARP_PORTS               Ports to scan. Default: 2408 500 1701 4500
   WARP_ENDPOINT_IPS        Space-separated endpoint IPs to scan
   WARP_MAX_PROBES          Max endpoints probed per scan pass. Default: 60
@@ -259,6 +270,8 @@ for arg in "$@"; do
     --accept=*) ACCEPT_LOCS="${arg#*=}" ;;
     --prefer=*) PREFERRED_LOCS="${arg#*=}" ;;
     --watchdog-interval=*) WATCHDOG_INTERVAL_MIN="${arg#*=}" ;;
+    --slow-scan) PROBE_DELAY_MS=800 ;;
+    --probe-delay=*) PROBE_DELAY_MS="${arg#*=}" ;;
     --no-timer) INSTALL_TIMER=0 ;;
     --debug) set -x ;;
     -h|--help) usage; exit 0 ;;
@@ -715,6 +728,10 @@ scan_endpoints() {
       [[ -n "$PREFERRED_LOCS" && "$n" -le "$preferred_budget" ]] && label="${endpoint} [US-поиск]"
       render_progress "$n" "$probes_to_run" "$label"
 
+      if [[ "$PROBE_DELAY_MS" -gt 0 ]]; then
+        sleep "$(awk -v ms="$PROBE_DELAY_MS" 'BEGIN{printf "%.3f", ms/1000}')"
+      fi
+
       local baseline_ts
       baseline_ts="$(wg show "$IFACE" latest-handshakes 2>/dev/null | awk '{print $2}')"
 
@@ -906,6 +923,46 @@ diagnose_udp_block() {
       warn "Найдено явное DROP/REJECT правило конкретно для порта WARP:"
       printf '%s\n' "$warp_drop" | while IFS= read -r l; do warn "  $l"; done
     fi
+  fi
+
+  # 4) Dynamic anti-torrent / DPI daemons (e.g. ipset+xt_string based
+  #    blockers commonly run alongside Xray/Remnawave) ban IPs in real
+  #    time based on traffic *behaviour*, not fixed ports — a static
+  #    `iptables -L` snapshot can miss this entirely if rules live in an
+  #    ipset set, or if the ban already expired by the time we look. A
+  #    fast burst of 60 UDP probes to dozens of different Cloudflare IPs
+  #    in under a minute (exactly what the scanner just did) looks a lot
+  #    like P2P peer-swarming to a behavioural/FIN_WAIT heuristic.
+  local found_blocker_svc=""
+  local svc
+  for svc in torrent-blocker xray-blocker dpi-blocker antitorrent torrentguard; do
+    if systemctl is-active "$svc" >/dev/null 2>&1; then
+      found_blocker_svc="$svc"
+      break
+    fi
+  done
+
+  if [[ -n "$found_blocker_svc" ]]; then
+    warn "Обнаружен активный сервис '$found_blocker_svc' — анти-торрент демон с DPI/поведенческим анализом."
+    warn "Такие демоны банят IP ДИНАМИЧЕСКИ (через ipset, не только iptables) на основе паттернов трафика,"
+    warn "а не только по фиксированным портам — статичный 'iptables -L' выше мог этого не показать."
+    warn "Быстрый скан (60 UDP-проб за минуту к разным Cloudflare IP) сам похож на P2P-поведение"
+    warn "и может триггерить такой бан по ошибке (false positive)."
+    if command -v ipset >/dev/null 2>&1; then
+      local ipset_sets
+      ipset_sets="$(ipset list -n 2>/dev/null || true)"
+      if [[ -n "$ipset_sets" ]]; then
+        info "Активные ipset-наборы (проверь, не там ли бан): $ipset_sets"
+      fi
+    fi
+    info "Попробуй сначала просто замедлить скан (он сам похож на burst-паттерн):"
+    info "  bash $0 --rescan-only --slow-scan"
+    info "Если это не помогло — временно останови демон и повтори обычный скан: systemctl stop $found_blocker_svc"
+    info "Если после остановки WARP подключается — это точно он, дальше добавь WARP IP (162.159.0.0/16,"
+    info "188.114.0.0/16) или UDP-порт 2408 в исключения/bypass этого демона (флаг --bypass у torrent-blocker)."
+  elif command -v ipset >/dev/null 2>&1 && [[ -n "$(ipset list -n 2>/dev/null)" ]]; then
+    info "ipset активен (наборы: $(ipset list -n 2>/dev/null | tr '\n' ' ')), хотя известный сервис-блокер не найден."
+    info "Если на сервере стоит свой анти-торрент/DPI скрипт — проверь его правила и логи отдельно."
   fi
 
   line
