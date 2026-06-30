@@ -843,37 +843,77 @@ diagnose_udp_block() {
   #    over plain TCP/443? If this also fails, it's likely outbound
   #    filtering in general, not something specific to UDP/WireGuard.
   if curl -4 --max-time 5 -s -o /dev/null "https://1.1.1.1/cdn-cgi/trace" 2>/dev/null; then
-    say "TCP/443 до Cloudflare (1.1.1.1) работает — значит блокировка не на TCP-уровне."
+    say "TCP/443 до Cloudflare (1.1.1.1) работает — блокировка не на TCP-уровне."
   else
     warn "Даже TCP/443 до Cloudflare (1.1.1.1) не проходит — проблема шире, не только WARP/UDP."
   fi
 
-  # 2) Direct UDP reachability test against the WARP port itself, bypassing
-  #    WireGuard entirely — a raw UDP packet to a known-good Cloudflare WARP
-  #    IP. If this also gets nothing back, outbound UDP is filtered at the
-  #    host/network level (provider firewall, security group, iptables).
+  # 2) Raw UDP send test against several WARP ports/IPs, bypassing
+  #    WireGuard entirely. A successful local `nc` send only proves the
+  #    packet left the box without an immediate ICMP-unreachable — it does
+  #    NOT prove anything arrived, since UDP is connectionless. This is
+  #    just a sanity check that nothing local refuses to even construct
+  #    the socket (e.g. a raw-socket cap restriction in some containers).
   if command -v nc >/dev/null 2>&1; then
-    if timeout 5 bash -c "echo -n '' | nc -4u -w3 162.159.192.1 2408" 2>/dev/null; then
-      info "UDP/2408 пакет до 162.159.192.1 отправлен без немедленной ошибки (не гарантирует ответ, но порт не закрыт локально)."
+    local probe_failed=0
+    local probe
+    for probe in "162.159.192.1:2408" "188.114.96.1:500" "162.159.193.10:4500"; do
+      local pip="${probe%:*}" pport="${probe#*:}"
+      if ! timeout 4 bash -c "echo -n '' | nc -4u -w2 '$pip' '$pport'" 2>/dev/null; then
+        probe_failed=$((probe_failed + 1))
+      fi
+    done
+    if [[ "$probe_failed" -eq 0 ]]; then
+      info "Локальная отправка UDP-пакетов на тестовые WARP IP/порты не встретила немедленных ошибок."
     else
-      warn "Не удалось даже отправить UDP-пакет на 162.159.192.1:2408 — возможно iptables/security group режут исходящий UDP локально."
+      warn "$probe_failed из 3 локальных UDP-отправок завершились с ошибкой — возможна блокировка на уровне ОС/контейнера."
     fi
   fi
 
-  # 3) Look for an obviously restrictive local firewall (common cause when
-  #    a VPS panel auto-applies an inbound-only iptables/nft profile that
-  #    also accidentally affects outbound UDP via default-deny chains).
+  # 3) iptables/nftables: check the chains that actually decide the fate
+  #    of OUR traffic specifically, not just grep for any DROP line — the
+  #    earlier version flagged P2P/torrent block rules (BitTorrent, eMule,
+  #    DC++ ports) that have nothing to do with WARP and just caused
+  #    confusion. What actually matters: (a) the OUTPUT chain's default
+  #    policy, and (b) whether there's an explicit ACCEPT for the WARP
+  #    ports at all — under a default-DROP policy, *absence* of an ACCEPT
+  #    rule is the real blocker, not presence of unrelated DROP rules.
   if command -v iptables >/dev/null 2>&1; then
-    local udp_drop
-    udp_drop="$(iptables -L OUTPUT -n 2>/dev/null | grep -i 'udp' | grep -iE 'drop|reject' || true)"
-    if [[ -n "$udp_drop" ]]; then
-      warn "Найдены DROP/REJECT правила для UDP в OUTPUT chain — это может блокировать WARP:"
-      printf '%s\n' "$udp_drop" | while IFS= read -r l; do warn "  $l"; done
+    local output_policy
+    output_policy="$(iptables -L OUTPUT -n 2>/dev/null | head -1 | grep -oP '(?<=policy )\w+' || echo "UNKNOWN")"
+    info "OUTPUT chain default policy: ${output_policy}"
+
+    if [[ "$output_policy" == "DROP" || "$output_policy" == "REJECT" ]]; then
+      local has_warp_accept
+      has_warp_accept="$(iptables -L OUTPUT -n 2>/dev/null | grep -E 'ACCEPT.*udp.*(2408|dpt:500|1701|4500)' || true)"
+      if [[ -z "$has_warp_accept" ]]; then
+        warn "OUTPUT policy=${output_policy} и НЕТ явного ACCEPT для портов WARP (2408/500/1701/4500)."
+        warn "Это сильный кандидат на причину: добавь правило вручную, например:"
+        warn "  iptables -I OUTPUT -p udp --dport 2408 -j ACCEPT"
+      else
+        info "Явный ACCEPT для портов WARP найден в OUTPUT — на уровне iptables разрешено."
+      fi
+    else
+      info "OUTPUT policy=${output_policy} (не блокирующая по умолчанию) — iptables, скорее всего, не причина."
+    fi
+
+    # Surface any DROP rule that specifically targets a WARP port (rare,
+    # but possible) — unrelated P2P-port DROP rules are intentionally NOT
+    # shown anymore since they only caused false alarms.
+    local warp_drop
+    warp_drop="$(iptables -L OUTPUT -n 2>/dev/null | grep -iE 'drop|reject' | grep -E '2408|1701|udp dpt:500($| )|4500' || true)"
+    if [[ -n "$warp_drop" ]]; then
+      warn "Найдено явное DROP/REJECT правило конкретно для порта WARP:"
+      printf '%s\n' "$warp_drop" | while IFS= read -r l; do warn "  $l"; done
     fi
   fi
 
-  info "Если оба теста (TCP и UDP) выше провалились — почти наверняка хостер/датацентр режет исходящий трафик нестандартными способами."
-  info "Если TCP работает, а UDP нет — проси хостера открыть исходящий UDP (включая порты 2408, 500, 1701, 4500) или проверь security group/firewall в панели хостера."
+  line
+  info "ВАЖНО: многие хостеры (Hetzner, OVH, DigitalOcean, Vultr, AWS Security Groups и т.п.) держат отдельный"
+  info "облачный firewall ВНЕ сервера (в панели управления) — он не виден ни в iptables, ни в nft, и режет"
+  info "трафик ДО того, как пакет вообще доходит до ОС. Если правила выше выглядят нормально, в первую очередь"
+  info "проверь именно панель хостера: должен быть разрешён исходящий UDP, особенно на порт 2408."
+  info "Быстрый способ проверить версию 'не в iptables дело': временно 'iptables -P OUTPUT ACCEPT' и повторить скан."
 }
 
 install_watchdog() {
