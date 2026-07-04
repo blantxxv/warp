@@ -37,7 +37,13 @@ PROFILE="${WG_DIR}/wgcf-profile.conf"
 TRACE_URL="https://www.cloudflare.com/cdn-cgi/trace"
 LOG_FILE="/var/log/warp-auto-install.log"
 SCAN_LOG_FILE="/var/log/warp-scan.log"
+WATCHDOG_LOG="/var/log/warp-watchdog.log"
 SELF_PATH_INSTALLED="/root/warp-auto-install.sh"
+# Threshold (seconds) for considering the WireGuard handshake "fresh" —
+# i.e. the tunnel ("мост") is actually up and passing traffic, not just
+# that the interface exists. WireGuard rekeys at least every ~120s by
+# design, so anything older than this means the peer stopped responding.
+BRIDGE_HANDSHAKE_MAX_AGE="${WARP_BRIDGE_HANDSHAKE_MAX_AGE:-150}"
 
 # CIS / "near abroad" countries are denied by default alongside RU, since WARP
 # frequently routes them onto the same flagged egress pool as RU.
@@ -611,6 +617,54 @@ current_warp_status_line() {
   echo "warp=${warp:-} loc=${loc:-} colo=${colo:-} ip=${ip:-}"
 }
 
+# "Мост" = сам WireGuard-туннель до Cloudflare. Интерфейс может существовать,
+# но реально не отвечать (мёртвый peer) — единственный надёжный признак
+# живого туннеля это СВЕЖЕЕ рукопожатие, а не просто наличие интерфейса.
+# Возвращает 0 (мост жив) / 1 (моста нет или он мёртв) и печатает возраст
+# последнего handshake в секундах (или "never").
+bridge_up() {
+  local iface="$1"
+  local max_age="${2:-$BRIDGE_HANDSHAKE_MAX_AGE}"
+  if ! ip link show "$iface" >/dev/null 2>&1; then
+    echo "never"
+    return 1
+  fi
+  local hs now age
+  hs="$(wg show "$iface" latest-handshakes 2>/dev/null | awk '{print $2}')"
+  if [[ -z "$hs" || "$hs" == "0" ]]; then
+    echo "never"
+    return 1
+  fi
+  now="$(date +%s)"
+  age=$(( now - hs ))
+  echo "$age"
+  [[ "$age" -le "$max_age" ]]
+}
+
+# Читает systemd `is-enabled` для юнита без раздваивания вывода: для
+# несуществующего юнита systemctl пишет "not-found" в stdout И возвращает
+# ненулевой код, так что наивное `X || echo disabled` печатает оба слова
+# на отдельных строках. Тут разбираем это явно и всегда возвращаем ровно
+# одно значение.
+timer_status() {
+  local unit="$1"
+  local out
+  out="$(systemctl is-enabled "$unit" 2>/dev/null)"
+  if [[ -z "$out" || "$out" == "not-found" ]]; then
+    echo "disabled"
+  else
+    echo "$out"
+  fi
+}
+
+# Последняя строка из лога watchdog-а — позволяет реально убедиться, что
+# таймер срабатывает по расписанию, а не просто "включён" по systemd.
+timer_last_run() {
+  if [[ -f "$WATCHDOG_LOG" ]]; then
+    tail -n 1 "$WATCHDOG_LOG" 2>/dev/null
+  fi
+}
+
 # Waits up to HANDSHAKE_WAIT seconds (polling frequently) for the WireGuard
 # handshake timestamp to advance past $baseline_ts. Comparing against a
 # baseline (not just "is it non-zero") matters because we now switch peer
@@ -978,6 +1032,29 @@ install_watchdog() {
 
   step "Установка watchdog timer"
 
+  # Копируем себя ДО создания таймера, а не после: раньше self-copy шёл
+  # ПОСЛЕ `systemctl enable --now`, и если хост уже был в аптайме больше
+  # OnBootSec, таймер мог сработать мгновенно и дёрнуть ещё не
+  # скопированный файл. Плюс раньше ошибка копирования тихо проглатывалась
+  # через `|| true` — если скрипт запущен как `bash -s < script.sh` (curl |
+  # bash), $0 равен "bash"/"-bash", cp "$0" ничего не копирует, и watchdog
+  # каждые N минут дёргал бы несуществующий файл молча, без единого следа
+  # в логах. Теперь резолвим реальный путь и громко предупреждаем при неудаче.
+  local self_src=""
+  if [[ -f "$0" ]]; then
+    self_src="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+  fi
+  if [[ "$self_src" != "$SELF_PATH_INSTALLED" ]]; then
+    if [[ -n "$self_src" && -f "$self_src" ]] && cp -f "$self_src" "$SELF_PATH_INSTALLED" 2>>"$LOG_FILE"; then
+      chmod +x "$SELF_PATH_INSTALLED"
+    else
+      fail "Не удалось скопировать себя в $SELF_PATH_INSTALLED (запуск как 'bash -s' через pipe?)."
+      warn "Watchdog НЕ будет работать: каждый пересканинг будет вызывать несуществующий файл."
+      warn "Сохрани скрипт на диск и перезапусти: curl -fsSL <url> -o /root/warp-auto-install.sh && bash /root/warp-auto-install.sh"
+      return 1
+    fi
+  fi
+
   cat >/usr/local/sbin/warp-auto-recheck.sh <<EOF_RECHECK
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -995,6 +1072,14 @@ PREFERRED_LOCS="\${WARP_PREFERRED_LOCS:-\${PREFERRED_LOCS_DEFAULT}}"
 AI_CHECK_DOMAINS="\${WARP_AI_CHECK_DOMAINS:-\${AI_CHECK_DOMAINS_DEFAULT}}"
 AI_CHECK_MIN_OK_TENTHS="\${WARP_AI_CHECK_MIN_OK_TENTHS:-\${AI_CHECK_MIN_OK_TENTHS_DEFAULT}}"
 IFACE="${IFACE}"
+BRIDGE_HANDSHAKE_MAX_AGE="${BRIDGE_HANDSHAKE_MAX_AGE}"
+WATCHDOG_LOG="${WATCHDOG_LOG}"
+
+mkdir -p "\$(dirname "\$WATCHDOG_LOG")" 2>/dev/null || true
+
+log_watchdog() {
+  echo "\$(date '+%Y-%m-%d %H:%M:%S') \$*" >>"\$WATCHDOG_LOG"
+}
 
 trace_field() {
   local trace="\$1"
@@ -1030,13 +1115,34 @@ acceptable() {
   return 0
 }
 
+# "Мост" — сам туннель WireGuard до Cloudflare. Интерфейс может формально
+# существовать, пока peer давно не отвечает (мёртвый handshake) — единственный
+# надёжный признак живого моста это СВЕЖЕЕ рукопожатие, не просто наличие iface.
+# Печатает возраст handshake в секундах (или "never"), возвращает 0/1.
+bridge_up() {
+  if ! ip link show "\$IFACE" >/dev/null 2>&1; then
+    echo "never"
+    return 1
+  fi
+  local hs age
+  hs="\$(wg show "\$IFACE" latest-handshakes 2>/dev/null | awk '{print \$2}')"
+  if [[ -z "\$hs" || "\$hs" == "0" ]]; then
+    echo "never"
+    return 1
+  fi
+  age=\$(( \$(date +%s) - hs ))
+  echo "\$age"
+  [[ "\$age" -le "\$BRIDGE_HANDSHAKE_MAX_AGE" ]]
+}
+
 # Real end-to-end check: confirm chatgpt.com/claude.ai/gemini etc actually
 # answer through the warp interface, not just that Cloudflare's own trace
 # endpoint says warp=on/loc=OK. A WARP IP can be perfectly fine by
 # Cloudflare's own metric while being independently rate-limited/blocked by
 # the AI providers themselves (shared consumer WARP egress gets flagged).
-ai_domains_ok() {
-  local ok=0 total=0 code domain
+# Prints "ok total detail" (same format as the interactive check).
+run_ai_check() {
+  local ok=0 total=0 code domain detail=""
   for domain in \$AI_CHECK_DOMAINS; do
     total=\$((total + 1))
     code="\$(curl -4 --interface "\$IFACE" -o /dev/null -s -w '%{http_code}' \\
@@ -1044,24 +1150,61 @@ ai_domains_ok() {
     code="\${code:-000}"
     [[ "\$code" =~ ^[0-9]{4,}\$ ]] && code="\${code: -3}"
     [[ "\$code" != "000" ]] && ok=\$((ok + 1))
+    detail="\${detail}\${domain}=\${code} "
   done
-  [[ "\$total" -eq 0 ]] && return 1
-  (( ok * 10 >= AI_CHECK_MIN_OK_TENTHS * total ))
+  echo "\$ok \$total \$detail"
 }
 
-tr="\$(curl -4 --interface "\$IFACE" --max-time 8 -s "\$TRACE_URL" || true)"
-warp="\$(trace_field "\$tr" "warp")"
-loc="\$(trace_field "\$tr" "loc")"
+# 1) Мост: сам туннель живой? (свежий handshake)
+# ВАЖНО: под set -e голое "x=\$(cmd); rc=\$?" завершило бы скрипт на первой
+# же неудаче (ровно в том случае, который и нужно поймать) — используем
+# if/else, что явно исключено из -e по правилам bash.
+bridge_age="" bridge_ok=1
+if bridge_age="\$(bridge_up)"; then
+  bridge_ok=0
+else
+  bridge_ok=1
+fi
 
-if [[ "\$warp" == "on" ]] && acceptable "\$loc" && ai_domains_ok; then
+# 2) Loc по Cloudflare (только если мост живой — иначе трейс всё равно не пройдёт)
+warp="" loc=""
+if [[ "\$bridge_ok" -eq 0 ]]; then
+  tr="\$(curl -4 --interface "\$IFACE" --max-time 8 -s "\$TRACE_URL" || true)"
+  warp="\$(trace_field "\$tr" "warp")"
+  loc="\$(trace_field "\$tr" "loc")"
+fi
+
+# 3) Реальная доступность нейросетей (только если мост+loc уже ок — нет смысла
+#    гонять 5 HTTPS-запросов через мёртвый или заведомо denied-loc туннель)
+ai_ok=0 ai_total=0 ai_detail=""
+if [[ "\$bridge_ok" -eq 0 && "\$warp" == "on" ]] && acceptable "\$loc"; then
+  ai_result="\$(run_ai_check)"
+  ai_ok="\$(echo "\$ai_result" | awk '{print \$1}')"
+  ai_total="\$(echo "\$ai_result" | awk '{print \$2}')"
+  ai_detail="\$(echo "\$ai_result" | cut -d' ' -f3-)"
+fi
+ai_pass=0
+[[ "\$ai_total" -gt 0 ]] && (( ai_ok * 10 >= AI_CHECK_MIN_OK_TENTHS * ai_total )) && ai_pass=1
+
+if [[ "\$bridge_ok" -eq 0 ]]; then bridge_label="up(age=\${bridge_age}s)"; else bridge_label="DOWN(age=\${bridge_age})"; fi
+
+if [[ "\$bridge_ok" -eq 0 ]] && [[ "\$warp" == "on" ]] && acceptable "\$loc" && [[ "\$ai_pass" -eq 1 ]]; then
+  log_watchdog "OK bridge=\$bridge_label loc=\${loc:-empty} ai=\${ai_ok}/\${ai_total} (\${ai_detail})"
   exit 0
 fi
 
-if [[ "\$warp" == "on" ]] && acceptable "\$loc"; then
-  logger -t warp-auto "WARP loc=\${loc:-empty} OK by Cloudflare, but AI domains unreachable through \$IFACE; rescanning"
+if [[ "\$bridge_ok" -ne 0 ]]; then
+  reason="мост мёртв (\$bridge_label)"
+elif [[ "\$warp" != "on" ]]; then
+  reason="WARP не поднят (warp=\${warp:-empty})"
+elif ! acceptable "\$loc"; then
+  reason="запрещённый/неприемлемый loc=\${loc:-empty}"
 else
-  logger -t warp-auto "Bad WARP state: warp=\${warp:-empty} loc=\${loc:-empty}; rescanning endpoints"
+  reason="AI-сервисы недоступны (\${ai_ok}/\${ai_total}: \${ai_detail})"
 fi
+
+log_watchdog "FAIL bridge=\$bridge_label loc=\${loc:-empty} ai=\${ai_ok}/\${ai_total} (\${ai_detail}) reason=\"\$reason\" -> rescanning"
+logger -t warp-auto "Bad WARP state: \$reason; rescanning endpoints"
 
 "${SELF_PATH_INSTALLED}" --rescan-only --deny="\${DENY_LOCS}" \${ACCEPT_LOCS:+--accept="\${ACCEPT_LOCS}"} \${PREFERRED_LOCS:+--prefer="\${PREFERRED_LOCS}"} --no-timer
 EOF_RECHECK
@@ -1098,10 +1241,20 @@ EOF_TIMER
     warn "Не удалось включить watchdog timer. Смотри $LOG_FILE."
   fi
 
-  # Keep a copy of this script where the watchdog/menu can call it back,
-  # mirroring the old behaviour where uninstall removed /root/warp-auto-install.sh.
-  if [[ "$0" != "$SELF_PATH_INSTALLED" ]]; then
-    cp -f "$0" "$SELF_PATH_INSTALLED" 2>/dev/null && chmod +x "$SELF_PATH_INSTALLED" || true
+  # Синхронный тестовый прогон СЕЙЧАС, а не ожидание первого срабатывания
+  # таймера — иначе "watchdog включён" ничем не подтверждено, и о поломке
+  # (например, self-copy или прав) узнали бы только через WATCHDOG_INTERVAL_MIN.
+  info "Тестовый прогон watchdog-проверки прямо сейчас (без ожидания таймера)..."
+  if systemctl start --wait warp-auto-recheck.service 2>>"$LOG_FILE"; then
+    local last_line
+    last_line="$(timer_last_run)"
+    if [[ -n "$last_line" ]]; then
+      say "Watchdog реально отработал: $last_line"
+    else
+      warn "Сервис отработал, но $WATCHDOG_LOG пуст — проверь /usr/local/sbin/warp-auto-recheck.sh вручную."
+    fi
+  else
+    warn "Тестовый запуск watchdog-сервиса завершился с ошибкой. Смотри: journalctl -u warp-auto-recheck.service -n 50"
   fi
 }
 
@@ -1134,7 +1287,10 @@ show_status() {
 
   endpoint="$(grep '^Endpoint' "$CONF" 2>/dev/null | awk -F'= ' '{print $2}' || true)"
   default_route="$(ip route | awk '/^default/ {print; exit}')"
-  timer="$(systemctl is-enabled warp-auto-recheck.timer 2>/dev/null || echo disabled)"
+  timer="$(timer_status warp-auto-recheck.timer)"
+  local bridge_age bridge_state
+  bridge_age="$(bridge_up "$IFACE" 2>/dev/null)" && bridge_state="жив" || bridge_state="МЁРТВ/нет"
+  [[ "$bridge_age" == "never" ]] && bridge_age="handshake не найден"
 
   format_status_value "Server loc" "${direct_loc:-UNKNOWN} / ${region}"
   format_status_value "Server IP" "$direct_ip"
@@ -1142,13 +1298,17 @@ show_status() {
   format_status_value "Direct WARP" "$direct_warp"
   line
   format_status_value "Interface" "$IFACE"
+  format_status_value "Мост (туннель)" "$bridge_state (handshake: ${bridge_age})"
   format_status_value "Endpoint" "$endpoint"
   format_status_value "WARP status" "$wwarp"
   format_status_value "WARP loc" "$wloc"
   format_status_value "WARP colo" "$wcolo"
   format_status_value "WARP IP" "$wip"
   format_status_value "Default route" "$default_route"
-  format_status_value "Timer" "$timer"
+  format_status_value "Timer (enabled)" "$timer"
+  format_status_value "Timer (active)" "$(systemctl is-active warp-auto-recheck.timer 2>/dev/null || echo inactive)"
+  format_status_value "Timer next run" "$(systemctl show warp-auto-recheck.timer -p NextElapseUSecRealtime --value 2>/dev/null || echo —)"
+  format_status_value "Watchdog last run" "$(timer_last_run)"
   format_status_value "Log" "$LOG_FILE"
   line
 
@@ -1177,7 +1337,14 @@ show_status() {
 }
 
 print_final_summary() {
+  local install_status="${1:-OK}"
   banner
+  if [[ "$install_status" == "FAILED" ]]; then
+    line
+    printf "${RED}${BOLD}  ✗ УСТАНОВКА НЕ ЗАВЕРШЕНА: допустимый (не RU/CIS) egress НЕ найден за этот скан${RESET}\n"
+    printf "${RED}  Показанные ниже loc/endpoint — это состояние ПОСЛЕ ПРОВАЛА, а не осознанный выбор скрипта.${RESET}\n"
+    line
+  fi
   step "Итог установки"
 
   local direct_loc region warpstat endpoint default_route timer
@@ -1186,15 +1353,20 @@ print_final_summary() {
   warpstat="$(current_warp_status_line)"
   endpoint="$(grep '^Endpoint' "$CONF" 2>/dev/null | awk -F'= ' '{print $2}' || true)"
   default_route="$(ip route | awk '/^default/ {print; exit}')"
-  timer="$(systemctl is-enabled warp-auto-recheck.timer 2>/dev/null || echo disabled)"
+  timer="$(timer_status warp-auto-recheck.timer)"
+  local bridge_age bridge_state
+  bridge_age="$(bridge_up "$IFACE" 2>/dev/null)" && bridge_state="жив" || bridge_state="МЁРТВ/нет"
+  [[ "$bridge_age" == "never" ]] && bridge_age="handshake не найден"
 
   format_status_value "Server loc" "${direct_loc:-UNKNOWN} / ${region}"
   format_status_value "WireGuard iface" "$IFACE"
+  format_status_value "Мост (туннель)" "$bridge_state (handshake: ${bridge_age})"
   format_status_value "Endpoint" "$endpoint"
   format_status_value "Config" "$CONF"
   format_status_value "Default route" "$default_route"
   format_status_value "WARP trace" "$warpstat"
-  format_status_value "Timer" "$timer"
+  format_status_value "Timer" "$timer ($(systemctl is-active warp-auto-recheck.timer 2>/dev/null || echo inactive))"
+  format_status_value "Watchdog last run" "$(timer_last_run)"
   format_status_value "Log" "$LOG_FILE"
 
   if ip link show "$IFACE" >/dev/null 2>&1; then
@@ -1381,14 +1553,31 @@ auto_install() {
   ensure_safe_conf
   start_warp
 
+  local scan_ok=1
   if ! scan_endpoints; then
-    fail "WARP установлен, но допустимый egress loc не найден."
-    print_final_summary || true
-    exit 2
+    scan_ok=0
+    fail "Скан не нашёл допустимый egress loc за этот проход (см. $SCAN_LOG_FILE)."
+    warn "WARP интерфейс сейчас в состоянии ОТКАЗА (последний испробованный endpoint, не осознанный выбор)."
   fi
 
-  install_watchdog
-  print_final_summary
+  # Ставим watchdog в любом случае: даже если этот проход скана не нашёл
+  # приемлемый loc, таймер продолжит пытаться пересканировать по расписанию,
+  # вместо того чтобы навсегда оставить ноду в плохом состоянии до ручного
+  # перезапуска скрипта. `|| true`: если install_watchdog не смог
+  # скопировать себя (см. её собственный fail/warn), не роняем весь
+  # install под set -e — итоговая сводка ниже всё равно покажет, что
+  # Timer выключен, и это будет видно, а не тихо оборвёт установку.
+  install_watchdog || true
+
+  if [[ "$scan_ok" -eq 1 ]]; then
+    print_final_summary
+  else
+    print_final_summary "FAILED"
+    fail "Установка WARP интерфейса прошла, но допустимый egress НЕ найден — см. поле 'Мост'/'WARP loc' выше."
+    info "Watchdog установлен и будет пытаться пересканировать каждые ${WATCHDOG_INTERVAL_MIN} мин."
+    info "Форсировать пересканирование сейчас: bash $0 --rescan-only"
+    exit 2
+  fi
 }
 
 menu() {
